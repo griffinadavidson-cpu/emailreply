@@ -17,6 +17,7 @@ ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY")
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -372,7 +373,7 @@ def slack_actions():
 
         # Forward to n8n for edit & send flow
         requests.post(
-            "https://n8n-xmux.onrender.com/webhook/366f0eeb-ec30-48e4-bfa7-5bead1c669a3",
+            N8N_WEBHOOK_URL,
             json={
                 "reply_to_uuid": meta.get("reply_to_uuid"),
                 "eaccount": meta.get("eaccount"),
@@ -414,8 +415,8 @@ def slack_events():
 
     event = data.get("event", {})
 
-    # Ignore bot messages, non-thread messages, and META system messages
-    if event.get("bot_id") or not event.get("thread_ts") or "META:" in event.get("text", ""):
+    # Ignore bot messages and non-thread messages
+    if event.get("bot_id") or not event.get("thread_ts"):
         return "", 200
 
     thread_ts = event["thread_ts"]
@@ -447,29 +448,29 @@ def slack_events():
 
     meta = json.loads(meta_match.group(1))
 
-    def clean_email(raw):
-        # Handle Slack mailto: auto-link: <mailto:x@y.com|x@y.com>
-        if "mailto:" in raw:
-            raw = raw.split("mailto:")[1].split("|")[0].strip()
-        # Handle Slack URL auto-link on domain: x@<http://domain.com|domain.com>
-        if "<http" in raw and "@" in raw:
-            local = raw.split("@")[0]
-            domain_part = raw.split("@")[1]
-            domain = domain_part.split("|")[-1].rstrip(">")
-            raw = f"{local}@{domain}"
-        raw = raw.replace("[at]", "@").strip()
-        return raw
+    # Clean up email addresses (Slack auto-links mailto:)
+    eaccount = meta.get("eaccount", "")
+    if "mailto:" in eaccount:
+        eaccount = eaccount.split("mailto:")[1].split("|")[0].strip()
+    eaccount = eaccount.replace("[at]", "@")
 
-    eaccount = clean_email(meta.get("eaccount", ""))
-    lead_email = clean_email(meta.get("lead_email", ""))
+    lead_email = meta.get("lead_email", "")
+    if "mailto:" in lead_email:
+        lead_email = lead_email.split("mailto:")[1].split("|")[0].strip()
+    lead_email = lead_email.replace("[at]", "@")
 
-    # Send edited reply directly to Instantly
-    print(f"[slack_events] sending to Instantly. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount}")
-    send_instantly_reply(
-        reply_to_uuid=meta.get("reply_to_uuid", ""),
-        eaccount=eaccount,
-        subject=meta.get("subject", "Re:"),
-        body=reply_text,
+    # Forward edited reply to n8n
+    print(f"[slack_events] forwarding to n8n. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} body_preview={reply_text[:80]}")
+    requests.post(
+        N8N_WEBHOOK_URL,
+        json={
+            "reply_to_uuid": meta.get("reply_to_uuid", ""),
+            "eaccount": eaccount,
+            "subject": meta.get("subject", "Re:"),
+            "lead_email": lead_email,
+            "deal_id": meta.get("deal_id", ""),
+            "edited_body": reply_text,
+        },
     )
     print(f"[edit_send] Sent edited reply to {lead_email}")
 
