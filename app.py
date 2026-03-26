@@ -319,6 +319,7 @@ def slack_actions():
     action = payload.get("actions", [{}])[0]
     action_id = action.get("action_id", "")
     meta = json.loads(action.get("value", "{}"))
+    print(f"[slack_action] action_id={action_id} reply_to_uuid={meta.get('reply_to_uuid')} eaccount={meta.get('eaccount')} lead={meta.get('lead_email')}")
 
     channel_id = payload.get("container", {}).get("channel_id", "")
     message_ts = payload.get("container", {}).get("message_ts", "")
@@ -408,7 +409,7 @@ def slack_events():
     messages = thread.get("messages", [])
 
     # Get the last human (non-bot) message as the edited reply
-    human_messages = [m for m in messages if not m.get("bot_id") and m.get("subtype") != "bot_message"]
+    human_messages = [m for m in messages if not m.get("bot_id") and m.get("subtype") != "bot_message" and "META:" not in m.get("text", "")]
     if not human_messages:
         return "", 200
     reply_text = human_messages[-1].get("text", "")
@@ -441,6 +442,7 @@ def slack_events():
     lead_email = lead_email.replace("[at]", "@")
 
     # Send the edited reply via Instantly
+    print(f"[slack_events] sending reply. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} body_preview={reply_text[:80]}")
     send_instantly_reply(
         reply_to_uuid=meta.get("reply_to_uuid", ""),
         eaccount=eaccount,
