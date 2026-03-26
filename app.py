@@ -236,8 +236,12 @@ def incoming_reply():
     campaign_name = body.get("campaign_name", "")
     campaign_id = body.get("campaign_id", "")
     email_account = body.get("email_account", "")
-    webhook_timestamp = body.get("timestamp_created", body.get("created_at", ""))
-    subject = body.get("subject", "Re:")
+    webhook_timestamp = body.get("timestamp") or body.get("timestamp_created") or body.get("created_at") or ""
+    if not webhook_timestamp:
+        from datetime import datetime, timezone
+        webhook_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        print(f"[warn] No timestamp in webhook, falling back to now: {webhook_timestamp}")
+    subject = body.get("reply_subject") or body.get("subject") or "Re:"
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
 
     # Step 1: Classify the reply
