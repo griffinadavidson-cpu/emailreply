@@ -10,6 +10,9 @@ load_dotenv()
 
 app = Flask(__name__)
 
+# In-memory store for edit flows (keyed by thread_ts)
+pending_edits = {}
+
 # --- Config ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")
@@ -192,7 +195,7 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: 
 @app.route("/webhook/incoming", methods=["POST"])
 def incoming_reply():
     data = request.json
-    body = data.get("body", data)  # support both nested and flat
+    body = data.get("body", data)
 
     lead_email = str(body.get("lead_email", ""))
     reply_snippet = body.get("reply_text_snippet", "")
@@ -238,6 +241,7 @@ def incoming_reply():
         "subject": subject,
         "lead_email": lead_email,
         "deal_id": deal_id,
+        "draft": draft,
     })
     meta_dismiss = json.dumps({
         "deal_id": deal_id,
@@ -286,7 +290,6 @@ def slack_actions():
     message_ts = payload.get("container", {}).get("message_ts", "")
 
     if action_id == "send_reply":
-        # Send the AI draft directly via Instantly
         draft = meta.get("draft", "")
         if meta.get("reply_to_uuid") and meta.get("eaccount"):
             send_instantly_reply(
@@ -297,7 +300,6 @@ def slack_actions():
             )
             print(f"[send_reply] Sent draft to {meta.get('lead_email')}")
 
-        # Acknowledge in Slack via response_url
         response_url = payload.get("response_url")
         if response_url:
             requests.post(response_url, json={
@@ -308,28 +310,25 @@ def slack_actions():
         return "", 200
 
     elif action_id == "edit_reply":
-        # Post draft in a thread for editing
-        eaccount_safe = meta.get("eaccount", "").replace("@", "[at]")
-        lead_email_safe = meta.get("lead_email", "").replace("@", "[at]")
-        thread_meta = json.dumps({
-            "reply_to_uuid": meta.get("reply_to_uuid"),
-            "eaccount": eaccount_safe,
-            "subject": meta.get("subject", "Re:"),
-            "lead_email": lead_email_safe,
-            "deal_id": meta.get("deal_id"),
-        })
-
-        text = (
-            f"\u270f\ufe0f *Edit the draft below and reply to this thread to send it.*\n\n"
-            f"{meta.get('draft', '')}\n\n"
-            f"META: {thread_meta}"
+        # Post the draft into a thread for the user to edit
+        post_slack_chat(
+            channel_id,
+            message_ts,
+            f"\u270f\ufe0f *Edit the draft below and reply to this thread to send it.*\n\n{meta.get('draft', '')}"
         )
 
-        post_slack_chat(channel_id, message_ts, text)
+        # Store meta server-side keyed by message_ts (the parent thread ts)
+        pending_edits[message_ts] = {
+            "reply_to_uuid": meta.get("reply_to_uuid"),
+            "eaccount": meta.get("eaccount"),
+            "subject": meta.get("subject", "Re:"),
+            "lead_email": meta.get("lead_email"),
+            "deal_id": meta.get("deal_id"),
+        }
+
         return "", 200
 
     elif action_id == "dismiss":
-        # Acknowledge dismissal
         response_url = payload.get("response_url")
         if response_url:
             requests.post(response_url, json={
@@ -362,51 +361,34 @@ def slack_events():
     thread_ts = event["thread_ts"]
     channel = event["channel"]
 
-    # Fetch the thread to find the META data and the user's edited reply
+    # Look up meta from server-side store
+    meta = pending_edits.get(thread_ts)
+    if not meta:
+        return "", 200
+
+    # Fetch thread and get the latest human reply
     thread = fetch_slack_thread(channel, thread_ts)
     messages = thread.get("messages", [])
-
-    # Get the last human (non-bot) message as the edited reply
-    human_messages = [m for m in messages if not m.get("bot_id") and m.get("subtype") != "bot_message"]
+    human_messages = [
+        m for m in messages
+        if not m.get("bot_id") and m.get("subtype") != "bot_message"
+    ]
     if not human_messages:
         return "", 200
+
     reply_text = human_messages[-1].get("text", "")
 
-    # Find the META message
-    meta_message = None
-    for m in reversed(messages):
-        if m.get("text") and "META:" in m["text"]:
-            meta_message = m
-            break
-
-    if not meta_message:
-        return "", 200
-
-    meta_match = re.search(r"META: ({.+})", meta_message["text"])
-    if not meta_match:
-        return "", 200
-
-    meta = json.loads(meta_match.group(1))
-
-    # Clean up email addresses (Slack auto-links mailto:)
-    eaccount = meta.get("eaccount", "")
-    if "mailto:" in eaccount:
-        eaccount = eaccount.split("mailto:")[1].split("|")[0].strip()
-    eaccount = eaccount.replace("[at]", "@")
-
-    lead_email = meta.get("lead_email", "")
-    if "mailto:" in lead_email:
-        lead_email = lead_email.split("mailto:")[1].split("|")[0].strip()
-    lead_email = lead_email.replace("[at]", "@")
-
-    # Send the edited reply via Instantly
+    # Send via Instantly using clean server-side meta
     send_instantly_reply(
-        reply_to_uuid=meta.get("reply_to_uuid", ""),
-        eaccount=eaccount,
-        subject=meta.get("subject", "Re:"),
+        reply_to_uuid=meta["reply_to_uuid"],
+        eaccount=meta["eaccount"],
+        subject=meta["subject"],
         body=reply_text,
     )
-    print(f"[edit_send] Sent edited reply to {lead_email}")
+    print(f"[edit_send] Sent edited reply to {meta['lead_email']}")
+
+    # Clean up
+    del pending_edits[thread_ts]
 
     return "", 200
 
