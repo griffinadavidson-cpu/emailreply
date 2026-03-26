@@ -195,7 +195,9 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: 
 @app.route("/webhook/incoming", methods=["POST"])
 def incoming_reply():
     data = request.json
+    print(f"[RAW PAYLOAD] {json.dumps(data)}")  # ADD THIS
     body = data.get("body", data)
+    ...
 
     lead_email = str(body.get("lead_email", ""))
     reply_snippet = body.get("reply_text_snippet", "")
