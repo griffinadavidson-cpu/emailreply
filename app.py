@@ -414,8 +414,8 @@ def slack_events():
 
     event = data.get("event", {})
 
-    # Ignore bot messages and non-thread messages
-    if event.get("bot_id") or not event.get("thread_ts"):
+    # Ignore bot messages, non-thread messages, and META system messages
+    if event.get("bot_id") or not event.get("thread_ts") or "META:" in event.get("text", ""):
         return "", 200
 
     thread_ts = event["thread_ts"]
@@ -458,18 +458,13 @@ def slack_events():
         lead_email = lead_email.split("mailto:")[1].split("|")[0].strip()
     lead_email = lead_email.replace("[at]", "@")
 
-    # Forward edited reply to n8n
-    print(f"[slack_events] forwarding to n8n. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} body_preview={reply_text[:80]}")
-    requests.post(
-        "https://n8n-xmux.onrender.com/webhook/366f0eeb-ec30-48e4-bfa7-5bead1c669a3",
-        json={
-            "reply_to_uuid": meta.get("reply_to_uuid", ""),
-            "eaccount": eaccount,
-            "subject": meta.get("subject", "Re:"),
-            "lead_email": lead_email,
-            "deal_id": meta.get("deal_id", ""),
-            "edited_body": reply_text,
-        },
+    # Send edited reply directly to Instantly
+    print(f"[slack_events] sending to Instantly. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount}")
+    send_instantly_reply(
+        reply_to_uuid=meta.get("reply_to_uuid", ""),
+        eaccount=eaccount,
+        subject=meta.get("subject", "Re:"),
+        body=reply_text,
     )
     print(f"[edit_send] Sent edited reply to {lead_email}")
 
