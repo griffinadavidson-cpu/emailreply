@@ -1,6 +1,5 @@
 import os
 import json
-import re
 import requests
 import anthropic
 from flask import Flask, request, jsonify
@@ -10,8 +9,22 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# In-memory store for edit flows (keyed by thread_ts)
-pending_edits = {}
+# Persistent edit store — survives gunicorn worker cycling
+PENDING_EDITS_FILE = "/tmp/pending_edits.json"
+
+def load_pending_edits():
+    try:
+        with open(PENDING_EDITS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_pending_edits(data):
+    try:
+        with open(PENDING_EDITS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[pending_edits] Failed to save: {e}")
 
 # --- Config ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -29,7 +42,6 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # ============================================================
 
 def classify_reply(reply_snippet: str) -> str:
-    """Use Claude Haiku to classify an email reply."""
     msg = claude.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=50,
@@ -47,7 +59,6 @@ def classify_reply(reply_snippet: str) -> str:
 
 def draft_reply(sender_name: str, email_account: str, lead_email: str,
                 campaign_name: str, reply_text: str) -> str:
-    """Use Claude Haiku to draft an email reply for INTERESTED leads."""
     prompt = f"""You are an AI assistant helping draft email replies for an M&A outreach campaign.
 
 ROLE: You are writing on behalf of the SENDER (the rep). The SENDER is reaching out to the PROSPECT to discuss a potential business acquisition or advisory relationship.
@@ -89,7 +100,6 @@ Full email thread: {reply_text}"""
 
 
 def extract_sender_name(email_account: str) -> str:
-    """Extract first name from email, e.g. john.tanner@x.com → John"""
     local = email_account.split("@")[0]
     first = local.split(".")[0]
     return first.capitalize()
@@ -170,7 +180,41 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
     return resp.json()
 
 
+def fetch_instantly_email_uuid(lead_email: str, campaign_id: str) -> str:
+    """Fetch the reply_to_uuid from Instantly API using lead email + campaign."""
+    try:
+        resp = requests.get(
+            "https://api.instantly.ai/api/v2/emails",
+            headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"},
+            params={
+                "campaign_id": campaign_id,
+                "email": lead_email,
+                "limit": 5,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        emails = data.get("items", data.get("data", []))
+        if emails:
+            for email in emails:
+                from_addr = email.get("from_address") or email.get("from", {}).get("address", "")
+                if from_addr == lead_email:
+                    uuid = email.get("id") or email.get("uuid") or email.get("email_id")
+                    if uuid:
+                        print(f"[uuid] Found reply UUID: {uuid}")
+                        return uuid
+            # Fallback: return first email id
+            first = emails[0]
+            uuid = first.get("id") or first.get("uuid") or first.get("email_id", "")
+            print(f"[uuid] Fallback UUID: {uuid}")
+            return uuid
+    except Exception as e:
+        print(f"[uuid] Failed to fetch UUID: {e}")
+    return ""
+
+
 def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: str) -> dict:
+    print(f"[instantly] Sending reply — uuid={reply_to_uuid} eaccount={eaccount} subject={subject}")
     resp = requests.post(
         "https://api.instantly.ai/api/v2/emails/reply",
         headers={
@@ -195,42 +239,52 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: 
 @app.route("/webhook/incoming", methods=["POST"])
 def incoming_reply():
     data = request.json
-    print(f"[RAW PAYLOAD] {json.dumps(data)}")  # ADD THIS
+    print(f"[RAW PAYLOAD] {json.dumps(data)}")
     body = data.get("body", data)
-    ...
 
     lead_email = str(body.get("lead_email", ""))
     reply_snippet = body.get("reply_text_snippet", "")
     reply_text = body.get("reply_text", "")
     campaign_name = body.get("campaign_name", "")
-    email_account = body.get("email_account", "")
-    email_id = body.get("email_id", "")
-    subject = body.get("subject", "Re:")
+    campaign_id = body.get("campaign_id", "")
+    email_account = body.get("email_account", body.get("sending_account", ""))
+    subject = body.get("reply_subject", body.get("subject", "Re:"))
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
 
-    # Step 1: Classify the reply
+    # Extra lead info
+    first_name = body.get("firstName", "")
+    last_name = body.get("lastName", "")
+    company_name = body.get("companyName", "")
+    job_title = body.get("jobTitle", "")
+    location = body.get("location", "")
+    linkedin = body.get("linkedIn", "")
+
+    # Step 1: Classify
     classification = classify_reply(reply_snippet)
     print(f"[classify] {lead_email} → {classification}")
 
     if classification != "INTERESTED":
         return jsonify({"status": "classified", "classification": classification}), 200
 
-    # Step 2: Extract sender name
+    # Step 2: Fetch UUID from Instantly API
+    reply_to_uuid = fetch_instantly_email_uuid(lead_email, campaign_id)
+
+    # Step 3: Sender name
     sender_name = extract_sender_name(email_account)
 
-    # Step 3: Upsert Attio company + person + deal
+    # Step 4: Upsert Attio
     upsert_attio_company(domain)
     upsert_attio_person(lead_email)
     deal = create_attio_deal(lead_email)
     deal_id = deal["data"]["id"]["record_id"]
 
-    # Step 4: Draft reply with Claude
+    # Step 5: Draft reply
     draft = draft_reply(sender_name, email_account, lead_email, campaign_name, reply_text)
     print(f"[draft] Generated {len(draft)} chars for {lead_email}")
 
-    # Step 5: Build Slack message with action buttons
+    # Step 6: Build meta
     meta_send = json.dumps({
-        "reply_to_uuid": email_id,
+        "reply_to_uuid": reply_to_uuid,
         "eaccount": email_account,
         "subject": subject,
         "lead_email": lead_email,
@@ -238,7 +292,7 @@ def incoming_reply():
         "draft": draft,
     })
     meta_edit = json.dumps({
-        "reply_to_uuid": email_id,
+        "reply_to_uuid": reply_to_uuid,
         "eaccount": email_account,
         "subject": subject,
         "lead_email": lead_email,
@@ -250,15 +304,25 @@ def incoming_reply():
         "lead_email": lead_email,
     })
 
+    # Step 7: Slack blocks with full lead info
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"\U0001f514 *New Interested Reply*\n"
             f"*Campaign:* {campaign_name}\n"
-            f"*Sender:* {email_account}\n"
-            f"*Lead:* {lead_email}"}},
+            f"*Sender Account:* {email_account}\n"
+            f"*Reply UUID:* `{reply_to_uuid or 'NOT FOUND'}`"}},
+        {"type": "divider"},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Lead Email:*\n{lead_email}"},
+            {"type": "mrkdwn", "text": f"*Name:*\n{first_name} {last_name}"},
+            {"type": "mrkdwn", "text": f"*Company:*\n{company_name}"},
+            {"type": "mrkdwn", "text": f"*Title:*\n{job_title}"},
+            {"type": "mrkdwn", "text": f"*Location:*\n{location}"},
+            {"type": "mrkdwn", "text": f"*LinkedIn:*\n{linkedin if linkedin else 'N/A'}"},
+        ]},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
-            f"*Lead's Reply:*\n{reply_snippet}"}},
+            f"*Subject:* {subject}\n\n*Their Reply:*\n{reply_snippet}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*AI Draft:*\n{draft}"}},
@@ -308,26 +372,26 @@ def slack_actions():
                 "replace_original": "true",
                 "text": f"\u2705 Reply sent to {meta.get('lead_email', 'lead')}",
             })
-
         return "", 200
 
     elif action_id == "edit_reply":
-        # Post the draft into a thread for the user to edit
         post_slack_chat(
             channel_id,
             message_ts,
             f"\u270f\ufe0f *Edit the draft below and reply to this thread to send it.*\n\n{meta.get('draft', '')}"
         )
 
-        # Store meta server-side keyed by message_ts (the parent thread ts)
-        pending_edits[message_ts] = {
+        # Save to file so it survives worker restarts
+        pending = load_pending_edits()
+        pending[message_ts] = {
             "reply_to_uuid": meta.get("reply_to_uuid"),
             "eaccount": meta.get("eaccount"),
             "subject": meta.get("subject", "Re:"),
             "lead_email": meta.get("lead_email"),
             "deal_id": meta.get("deal_id"),
         }
-
+        save_pending_edits(pending)
+        print(f"[edit_reply] Stored pending edit for thread {message_ts}")
         return "", 200
 
     elif action_id == "dismiss":
@@ -350,25 +414,23 @@ def slack_actions():
 def slack_events():
     data = request.json
 
-    # Handle Slack URL verification challenge
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]}), 200
 
     event = data.get("event", {})
 
-    # Ignore bot messages and non-thread messages
     if event.get("bot_id") or not event.get("thread_ts"):
         return "", 200
 
     thread_ts = event["thread_ts"]
     channel = event["channel"]
 
-    # Look up meta from server-side store
-    meta = pending_edits.get(thread_ts)
+    pending = load_pending_edits()
+    meta = pending.get(thread_ts)
     if not meta:
+        print(f"[slack_events] No pending edit for thread {thread_ts}")
         return "", 200
 
-    # Fetch thread and get the latest human reply
     thread = fetch_slack_thread(channel, thread_ts)
     messages = thread.get("messages", [])
     human_messages = [
@@ -379,8 +441,8 @@ def slack_events():
         return "", 200
 
     reply_text = human_messages[-1].get("text", "")
+    print(f"[slack_events] Sending edited reply for {meta.get('lead_email')} — uuid={meta.get('reply_to_uuid')}")
 
-    # Send via Instantly using clean server-side meta
     send_instantly_reply(
         reply_to_uuid=meta["reply_to_uuid"],
         eaccount=meta["eaccount"],
@@ -389,8 +451,8 @@ def slack_events():
     )
     print(f"[edit_send] Sent edited reply to {meta['lead_email']}")
 
-    # Clean up
-    del pending_edits[thread_ts]
+    del pending[thread_ts]
+    save_pending_edits(pending)
 
     return "", 200
 
