@@ -326,14 +326,17 @@ def slack_actions():
     if action_id == "send_reply":
         # Send the AI draft directly via Instantly
         draft = meta.get("draft", "")
+        print(f"[slack_action] send_reply triggered. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={meta.get('eaccount')} lead={meta.get('lead_email')}")
         if meta.get("reply_to_uuid") and meta.get("eaccount"):
-            send_instantly_reply(
+            result = send_instantly_reply(
                 reply_to_uuid=meta["reply_to_uuid"],
                 eaccount=meta["eaccount"],
                 subject=meta.get("subject", "Re:"),
                 body=draft,
             )
-            print(f"[send_reply] Sent draft to {meta.get('lead_email')}")
+            print(f"[send_reply] Instantly response: {result}")
+        else:
+            print(f"[send_reply] SKIPPED — missing reply_to_uuid or eaccount. meta keys: {list(meta.keys())}")
 
         # Acknowledge in Slack via response_url
         response_url = payload.get("response_url")
