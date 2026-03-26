@@ -96,7 +96,7 @@ def upsert_attio_company(domain: str) -> dict:
     resp = requests.put(
         "https://api.attio.com/v2/objects/companies/records",
         params={"matching_attribute": "domains"},
-        headers={"Authorization": ATTIO_API_KEY, "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
         json={"data": {"values": {"domains": [{"domain": domain}]}}},
     )
     resp.raise_for_status()
@@ -107,7 +107,7 @@ def upsert_attio_person(lead_email: str) -> dict:
     resp = requests.put(
         "https://api.attio.com/v2/objects/people/records",
         params={"matching_attribute": "email_addresses"},
-        headers={"Authorization": ATTIO_API_KEY, "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
         json={"data": {"values": {"email_addresses": [{"email_address": lead_email}]}}},
     )
     resp.raise_for_status()
@@ -117,7 +117,7 @@ def upsert_attio_person(lead_email: str) -> dict:
 def create_attio_deal(lead_email: str) -> dict:
     resp = requests.post(
         "https://api.attio.com/v2/objects/deals/records",
-        headers={"Authorization": ATTIO_API_KEY, "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
         json={
             "data": {
                 "values": {
@@ -171,7 +171,7 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: 
     resp = requests.post(
         "https://api.instantly.ai/api/v2/emails/reply",
         headers={
-            "Authorization": INSTANTLY_API_KEY,
+            "Authorization": f"Bearer {INSTANTLY_API_KEY}",
             "Content-Type": "application/json",
         },
         json={
