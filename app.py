@@ -447,16 +447,22 @@ def slack_events():
 
     meta = json.loads(meta_match.group(1))
 
-    # Clean up email addresses (Slack auto-links mailto:)
-    eaccount = meta.get("eaccount", "")
-    if "mailto:" in eaccount:
-        eaccount = eaccount.split("mailto:")[1].split("|")[0].strip()
-    eaccount = eaccount.replace("[at]", "@")
+    def clean_email(raw):
+        # Handle Slack mailto: auto-link: <mailto:x@y.com|x@y.com>
+        if "mailto:" in raw:
+            raw = raw.split("mailto:")[1].split("|")[0].strip()
+        # Handle Slack URL auto-link on domain: x@<http://domain.com|domain.com>
+        if "<http" in raw:
+            local = raw.split("@")[0]
+            domain_part = raw.split("@")[1]
+            # extract domain from <http://domain.com|domain.com> → domain.com
+            domain = domain_part.split("|")[-1].rstrip(">")
+            raw = f"{local}@{domain}"
+        raw = raw.replace("[at]", "@").strip()
+        return raw
 
-    lead_email = meta.get("lead_email", "")
-    if "mailto:" in lead_email:
-        lead_email = lead_email.split("mailto:")[1].split("|")[0].strip()
-    lead_email = lead_email.replace("[at]", "@")
+    eaccount = clean_email(meta.get("eaccount", ""))
+    lead_email = clean_email(meta.get("lead_email", ""))
 
     # Send edited reply directly to Instantly
     print(f"[slack_events] sending to Instantly. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount}")
