@@ -198,7 +198,7 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str, webhook_timest
             f"campaign={campaign_id} after {min_ts}"
         )
 
-    uuid = emails[0].get("message_id")
+    uuid = emails[0].get("id")
     print(f"[fetch_uuid] Resolved reply_to_uuid={uuid} for {lead_email}")
     return uuid
 
