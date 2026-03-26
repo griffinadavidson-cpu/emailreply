@@ -167,9 +167,12 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
     return resp.json()
 
 
-def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> str:
+def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
     """
-    Hit GET /v2/emails with campaign_id and lead and return the id of the first result (index 0).
+    Hit GET /v2/emails with campaign_id and lead.
+    Returns (reply_to_uuid, eaccount):
+      - reply_to_uuid: id from index 0 (most recent email)
+      - eaccount:      eaccount from last item (original outbound send)
     Raises if nothing comes back.
     """
     resp = requests.get(
@@ -178,6 +181,7 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> str:
         params={
             "campaign_id": campaign_id,
             "lead": lead_email,
+            "limit": 10,
         },
     )
     resp.raise_for_status()
@@ -190,24 +194,28 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> str:
         )
 
     uuid = emails[0].get("id")
-    print(f"[fetch_uuid] Resolved reply_to_uuid={uuid} for {lead_email}")
-    return uuid
+    eaccount = emails[-1].get("eaccount")
+    print(f"[fetch_uuid] reply_to_uuid={uuid} eaccount={eaccount} for {lead_email}")
+    return uuid, eaccount
 
 
 def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: str) -> dict:
+    payload = {
+        "reply_to_uuid": reply_to_uuid,
+        "eaccount": eaccount,
+        "subject": subject,
+        "body": {"html": body, "text": body},
+    }
+    print(f"[send_reply] Payload: {json.dumps(payload)}")
     resp = requests.post(
         "https://api.instantly.ai/api/v2/emails/reply",
         headers={
             "Authorization": f"Bearer {INSTANTLY_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "reply_to_uuid": reply_to_uuid,
-            "eaccount": eaccount,
-            "subject": subject,
-            "body": {"html": body, "text": body},
-        },
+        json=payload,
     )
+    print(f"[send_reply] Instantly status={resp.status_code} body={resp.text}")
     resp.raise_for_status()
     return resp.json()
 
@@ -226,7 +234,6 @@ def incoming_reply():
     reply_text = body.get("reply_text", "")
     campaign_name = body.get("campaign_name", "")
     campaign_id = body.get("campaign_id", "")
-    email_account = body.get("email_account", "")
 
     subject = body.get("reply_subject") or body.get("subject") or "Re:"
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
@@ -239,10 +246,10 @@ def incoming_reply():
         return jsonify({"status": "classified", "classification": classification}), 200
 
     # Step 2: Resolve the reply_to_uuid from Instantly (webhook doesn't include it)
-    reply_to_uuid = fetch_instantly_reply_uuid(campaign_id, lead_email)
+    reply_to_uuid, eaccount = fetch_instantly_reply_uuid(campaign_id, lead_email)
 
     # Step 3: Extract sender name
-    sender_name = extract_sender_name(email_account)
+    sender_name = extract_sender_name(eaccount)
 
     # Step 4: Upsert Attio company + person + deal
     upsert_attio_company(domain)
@@ -251,13 +258,13 @@ def incoming_reply():
     deal_id = deal["data"]["id"]["record_id"]
 
     # Step 5: Draft reply with Claude
-    draft = draft_reply(sender_name, email_account, lead_email, campaign_name, reply_text)
+    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text)
     print(f"[draft] Generated {len(draft)} chars for {lead_email}")
 
     # Step 6: Build Slack message with action buttons
     meta_send = json.dumps({
         "reply_to_uuid": reply_to_uuid,
-        "eaccount": email_account,
+        "eaccount": eaccount,
         "subject": subject,
         "lead_email": lead_email,
         "deal_id": deal_id,
@@ -265,7 +272,7 @@ def incoming_reply():
     })
     meta_edit = json.dumps({
         "reply_to_uuid": reply_to_uuid,
-        "eaccount": email_account,
+        "eaccount": eaccount,
         "subject": subject,
         "lead_email": lead_email,
         "deal_id": deal_id,
@@ -279,7 +286,7 @@ def incoming_reply():
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"\U0001f514 *New Interested Reply*\n"
             f"*Campaign:* {campaign_name}\n"
-            f"*Sender:* {email_account}\n"
+            f"*Sender:* {eaccount}\n"
             f"*Lead:* {lead_email}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
