@@ -368,6 +368,22 @@ def slack_actions():
         )
 
         post_slack_chat(channel_id, message_ts, text)
+
+        # Forward to n8n for edit & send flow
+        requests.post(
+            "https://n8n-xmux.onrender.com/webhook/366f0eeb-ec30-48e4-bfa7-5bead1c669a3",
+            json={
+                "reply_to_uuid": meta.get("reply_to_uuid"),
+                "eaccount": meta.get("eaccount"),
+                "subject": meta.get("subject", "Re:"),
+                "lead_email": meta.get("lead_email"),
+                "deal_id": meta.get("deal_id"),
+                "draft": meta.get("draft", ""),
+                "channel_id": channel_id,
+                "message_ts": message_ts,
+            },
+        )
+        print(f"[edit_reply] Forwarded to n8n for lead={meta.get('lead_email')}")
         return "", 200
 
     elif action_id == "dismiss":
