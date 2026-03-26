@@ -452,10 +452,9 @@ def slack_events():
         if "mailto:" in raw:
             raw = raw.split("mailto:")[1].split("|")[0].strip()
         # Handle Slack URL auto-link on domain: x@<http://domain.com|domain.com>
-        if "<http" in raw:
+        if "<http" in raw and "@" in raw:
             local = raw.split("@")[0]
             domain_part = raw.split("@")[1]
-            # extract domain from <http://domain.com|domain.com> → domain.com
             domain = domain_part.split("|")[-1].rstrip(">")
             raw = f"{local}@{domain}"
         raw = raw.replace("[at]", "@").strip()
