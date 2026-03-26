@@ -167,25 +167,17 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
     return resp.json()
 
 
-def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str, webhook_timestamp: str) -> str:
+def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> str:
     """
-    Hit GET /v2/emails with campaign_id, lead, and min_timestamp_created (1 day before
-    the webhook timestamp) and return the id of the first result (index 0).
+    Hit GET /v2/emails with campaign_id and lead and return the id of the first result (index 0).
     Raises if nothing comes back.
     """
-    from datetime import datetime, timedelta, timezone
-
-    # Parse the webhook timestamp and subtract 24 hours
-    dt = datetime.fromisoformat(webhook_timestamp.replace("Z", "+00:00"))
-    min_ts = (dt - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
     resp = requests.get(
         "https://api.instantly.ai/api/v2/emails",
         headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"},
         params={
             "campaign_id": campaign_id,
             "lead": lead_email,
-            "min_timestamp_created": min_ts,
         },
     )
     resp.raise_for_status()
@@ -194,8 +186,7 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str, webhook_timest
     emails = data.get("items", data) if isinstance(data, dict) else data
     if not emails:
         raise ValueError(
-            f"[fetch_uuid] No emails found for lead={lead_email} "
-            f"campaign={campaign_id} after {min_ts}"
+            f"[fetch_uuid] No emails found for lead={lead_email} campaign={campaign_id}"
         )
 
     uuid = emails[0].get("id")
@@ -236,11 +227,7 @@ def incoming_reply():
     campaign_name = body.get("campaign_name", "")
     campaign_id = body.get("campaign_id", "")
     email_account = body.get("email_account", "")
-    webhook_timestamp = body.get("timestamp") or body.get("timestamp_created") or body.get("created_at") or ""
-    if not webhook_timestamp:
-        from datetime import datetime, timezone
-        webhook_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        print(f"[warn] No timestamp in webhook, falling back to now: {webhook_timestamp}")
+
     subject = body.get("reply_subject") or body.get("subject") or "Re:"
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
 
@@ -252,7 +239,7 @@ def incoming_reply():
         return jsonify({"status": "classified", "classification": classification}), 200
 
     # Step 2: Resolve the reply_to_uuid from Instantly (webhook doesn't include it)
-    reply_to_uuid = fetch_instantly_reply_uuid(campaign_id, lead_email, webhook_timestamp)
+    reply_to_uuid = fetch_instantly_reply_uuid(campaign_id, lead_email)
 
     # Step 3: Extract sender name
     sender_name = extract_sender_name(email_account)
