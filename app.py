@@ -171,9 +171,10 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
 def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
     """
     Hit GET /v2/emails with campaign_id and lead.
-    Returns (reply_to_uuid, eaccount):
-      - reply_to_uuid: id from index 0 (most recent email)
-      - eaccount:      eaccount from last item (original outbound send)
+    Returns (reply_to_uuid, eaccount, lead_body_html):
+      - reply_to_uuid:  id from index 0 (most recent email)
+      - eaccount:       eaccount from last item (original outbound send)
+      - lead_body_html: body.html from index 0 (most recent email)
     Raises if nothing comes back.
     """
     resp = requests.get(
@@ -196,8 +197,9 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
 
     uuid = emails[0].get("id")
     eaccount = emails[-1].get("eaccount")
+    lead_body_html = emails[0].get("body", {}).get("html", "")
     print(f"[fetch_uuid] reply_to_uuid={uuid} eaccount={eaccount} for {lead_email}")
-    return uuid, eaccount
+    return uuid, eaccount, lead_body_html
 
 
 def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: str) -> dict:
@@ -247,7 +249,7 @@ def incoming_reply():
         return jsonify({"status": "classified", "classification": classification}), 200
 
     # Step 2: Resolve the reply_to_uuid from Instantly (webhook doesn't include it)
-    reply_to_uuid, eaccount = fetch_instantly_reply_uuid(campaign_id, lead_email)
+    reply_to_uuid, eaccount, lead_body_html = fetch_instantly_reply_uuid(campaign_id, lead_email)
 
     # Step 3: Extract sender name
     sender_name = extract_sender_name(eaccount)
@@ -278,6 +280,7 @@ def incoming_reply():
         "lead_email": lead_email,
         "deal_id": deal_id,
         "draft": draft,
+        "lead_body_html": lead_body_html,
     })
     meta_dismiss = json.dumps({
         "deal_id": deal_id,
@@ -383,6 +386,7 @@ def slack_actions():
                 "draft": meta.get("draft", ""),
                 "channel_id": channel_id,
                 "message_ts": message_ts,
+                "lead_body_html": meta.get("lead_body_html", ""),
             },
         )
         print(f"[edit_reply] Forwarded to n8n for lead={meta.get('lead_email')}")
