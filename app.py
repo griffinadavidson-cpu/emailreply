@@ -271,6 +271,7 @@ def incoming_reply():
         "lead_email": lead_email,
         "deal_id": deal_id,
         "draft": draft,
+        "campaign_id": campaign_id,
     })
     meta_dismiss = json.dumps({
         "deal_id": deal_id,
@@ -376,6 +377,7 @@ def slack_actions():
                 "draft": meta.get("draft", ""),
                 "channel_id": channel_id,
                 "message_ts": message_ts,
+                "campaign_id": meta.get("campaign_id"),
             },
         )
         print(f"[edit_reply] Forwarded to n8n for lead={meta.get('lead_email')}")
@@ -463,6 +465,7 @@ def slack_events():
             "lead_email": lead_email,
             "deal_id": meta.get("deal_id", ""),
             "edited_body": reply_text,
+            "campaign_id": meta.get("campaign_id", ""),
         },
     )
     print(f"[edit_send] Sent edited reply to {lead_email}")
