@@ -22,25 +22,6 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Dedup cache: skip if same lead_email was processed recently
-_recent_leads = {}  # {lead_email: timestamp}
-DEDUP_WINDOW = 21600  # 6 hours in seconds
-
-
-def is_duplicate_lead(lead_email: str) -> bool:
-    """Return True if this lead was already processed within the dedup window."""
-    now = time.time()
-    # Clean up old entries
-    expired = [k for k, v in _recent_leads.items() if now - v > DEDUP_WINDOW]
-    for k in expired:
-        del _recent_leads[k]
-    # Check if duplicate
-    if lead_email in _recent_leads:
-        print(f"[dedup] Skipping duplicate for {lead_email} (processed {now - _recent_leads[lead_email]:.1f}s ago)")
-        return True
-    _recent_leads[lead_email] = now
-    return False
-
 
 # ============================================================
 # HELPERS
@@ -322,10 +303,6 @@ def incoming_reply():
     body = data.get("body", data)  # support both nested and flat
 
     lead_email = str(body.get("lead_email", ""))
-
-    # Dedup: skip if this lead was already processed recently
-    if is_duplicate_lead(lead_email):
-        return jsonify({"status": "skipped", "reason": "duplicate"}), 200
 
     reply_snippet = body.get("reply_text_snippet", "")
     reply_text = body.get("reply_text", "")
