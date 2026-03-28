@@ -26,6 +26,28 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # HELPERS
 # ============================================================
 
+def clean_slack_email(email: str) -> str:
+    """Strip Slack's auto-linking from email addresses.
+
+    Slack auto-formats domains and emails into markup like:
+      <http://claygeni.us|claygeni.us>
+      <mailto:john@claygeni.us|john@claygeni.us>
+
+    This function reverses all known Slack mangling patterns.
+    """
+    if not email:
+        return ""
+    # Reverse the [at] workaround first
+    email = email.replace("[at]", "@")
+    # Handle <http://domain.com|domain.com> and <https://...> format
+    email = re.sub(r'<https?://([^|>]+)\|[^>]+>', r'\1', email)
+    email = re.sub(r'<https?://([^>]+)>', r'\1', email)
+    # Handle <mailto:email|email> format
+    email = re.sub(r'<mailto:([^|>]+)\|[^>]+>', r'\1', email)
+    email = re.sub(r'<mailto:([^>]+)>', r'\1', email)
+    return email.strip()
+
+
 def classify_reply(reply_snippet: str) -> str:
     """Use Claude Haiku to classify an email reply."""
     msg = claude.messages.create(
@@ -171,9 +193,10 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
 def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
     """
     Hit GET /v2/emails with campaign_id and lead.
-    Returns (reply_to_uuid, eaccount):
+    Returns (reply_to_uuid, eaccount, thread_html):
       - reply_to_uuid: id from index 0 (most recent email)
       - eaccount:      eaccount from last item (original outbound send)
+      - thread_html:   HTML body from index 0 (for threading)
     Raises if nothing comes back.
     """
     resp = requests.get(
@@ -196,18 +219,36 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
 
     uuid = emails[0].get("id")
     eaccount = emails[-1].get("eaccount")
-    print(f"[fetch_uuid] reply_to_uuid={uuid} eaccount={eaccount} for {lead_email}")
-    return uuid, eaccount
+
+    # Grab thread HTML for proper email threading
+    body_obj = emails[0].get("body", {})
+    if isinstance(body_obj, dict):
+        thread_html = body_obj.get("html", "")
+    else:
+        thread_html = str(body_obj) if body_obj else ""
+
+    print(f"[fetch_uuid] reply_to_uuid={uuid} eaccount={eaccount} thread_html_len={len(thread_html)} for {lead_email}")
+    return uuid, eaccount, thread_html
 
 
-def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: str) -> dict:
+def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
+                         body: str, thread_html: str = "") -> dict:
+    """Send a reply via Instantly with proper HTML threading."""
+    # Convert plain text newlines to HTML breaks
+    html_body = body.replace("\n", "<br>")
+
+    # Wrap reply + append original thread HTML for proper threading
+    full_html = f"<div>{html_body}</div>"
+    if thread_html:
+        full_html += f"<br>{thread_html}"
+
     payload = {
         "reply_to_uuid": reply_to_uuid,
         "eaccount": eaccount,
         "subject": subject,
-        "body": {"html": body, "text": body},
+        "body": {"html": full_html},
     }
-    print(f"[send_reply] Payload: {json.dumps(payload)}")
+    print(f"[send_reply] Payload: {json.dumps(payload)[:500]}")
     resp = requests.post(
         "https://api.instantly.ai/api/v2/emails/reply",
         headers={
@@ -216,7 +257,7 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str, body: 
         },
         json=payload,
     )
-    print(f"[send_reply] Instantly status={resp.status_code} body={resp.text}")
+    print(f"[send_reply] Instantly status={resp.status_code} body={resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
@@ -239,23 +280,23 @@ def incoming_reply():
     subject = body.get("reply_subject") or body.get("subject") or "Re:"
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
 
-    # Step 1: Resolve the reply_to_uuid from Instantly (webhook doesn't include it)
-    reply_to_uuid, eaccount = fetch_instantly_reply_uuid(campaign_id, lead_email)
+    # Step 1: Resolve the reply_to_uuid + thread HTML from Instantly
+    reply_to_uuid, eaccount, thread_html = fetch_instantly_reply_uuid(campaign_id, lead_email)
 
-    # Step 3: Extract sender name
+    # Step 2: Extract sender name
     sender_name = extract_sender_name(eaccount)
 
-    # Step 4: Upsert Attio company + person + deal
+    # Step 3: Upsert Attio company + person + deal
     upsert_attio_company(domain)
     upsert_attio_person(lead_email)
     deal = create_attio_deal(lead_email)
     deal_id = deal["data"]["id"]["record_id"]
 
-    # Step 5: Draft reply with Claude
+    # Step 4: Draft reply with Claude
     draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text)
     print(f"[draft] Generated {len(draft)} chars for {lead_email}")
 
-    # Step 6: Build Slack message with action buttons
+    # Step 5: Build Slack message with action buttons
     meta_send = json.dumps({
         "reply_to_uuid": reply_to_uuid,
         "eaccount": eaccount,
@@ -263,6 +304,7 @@ def incoming_reply():
         "lead_email": lead_email,
         "deal_id": deal_id,
         "draft": draft,
+        "thread_html": thread_html,
     })
     meta_edit = json.dumps({
         "reply_to_uuid": reply_to_uuid,
@@ -272,11 +314,37 @@ def incoming_reply():
         "deal_id": deal_id,
         "draft": draft,
         "campaign_id": campaign_id,
+        "thread_html": thread_html,
     })
     meta_dismiss = json.dumps({
         "deal_id": deal_id,
         "lead_email": lead_email,
     })
+
+    # Check if meta payloads exceed Slack's 2000 char limit for button values
+    # If thread_html is too large, store it separately and skip in meta
+    if len(meta_send) > 1900 or len(meta_edit) > 1900:
+        print(f"[warn] Meta payload too large for Slack buttons (send={len(meta_send)}, edit={len(meta_edit)}). Dropping thread_html from button meta.")
+        meta_send = json.dumps({
+            "reply_to_uuid": reply_to_uuid,
+            "eaccount": eaccount,
+            "subject": subject,
+            "lead_email": lead_email,
+            "deal_id": deal_id,
+            "draft": draft,
+            "campaign_id": campaign_id,
+            "refetch_thread": True,
+        })
+        meta_edit = json.dumps({
+            "reply_to_uuid": reply_to_uuid,
+            "eaccount": eaccount,
+            "subject": subject,
+            "lead_email": lead_email,
+            "deal_id": deal_id,
+            "draft": draft,
+            "campaign_id": campaign_id,
+            "refetch_thread": True,
+        })
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text":
@@ -321,15 +389,29 @@ def slack_actions():
     message_ts = payload.get("container", {}).get("message_ts", "")
 
     if action_id == "send_reply":
-        # Send the AI draft directly via Instantly
         draft = meta.get("draft", "")
-        print(f"[slack_action] send_reply triggered. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={meta.get('eaccount')} lead={meta.get('lead_email')}")
-        if meta.get("reply_to_uuid") and meta.get("eaccount"):
+        thread_html = meta.get("thread_html", "")
+
+        # If thread_html was too large for Slack button, refetch it
+        if meta.get("refetch_thread") and meta.get("campaign_id"):
+            try:
+                _, _, thread_html = fetch_instantly_reply_uuid(
+                    meta["campaign_id"], clean_slack_email(meta.get("lead_email", ""))
+                )
+            except Exception as e:
+                print(f"[send_reply] Failed to refetch thread_html: {e}")
+
+        eaccount = clean_slack_email(meta.get("eaccount", ""))
+        lead_email = clean_slack_email(meta.get("lead_email", ""))
+
+        print(f"[slack_action] send_reply triggered. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} lead={lead_email}")
+        if meta.get("reply_to_uuid") and eaccount:
             result = send_instantly_reply(
                 reply_to_uuid=meta["reply_to_uuid"],
-                eaccount=meta["eaccount"],
+                eaccount=eaccount,
                 subject=meta.get("subject", "Re:"),
                 body=draft,
+                thread_html=thread_html,
             )
             print(f"[send_reply] Instantly response: {result}")
         else:
@@ -340,21 +422,22 @@ def slack_actions():
         if response_url:
             requests.post(response_url, json={
                 "replace_original": "true",
-                "text": f"\u2705 Reply sent to {meta.get('lead_email', 'lead')}",
+                "text": f"\u2705 Reply sent to {lead_email}",
             })
 
         return "", 200
 
     elif action_id == "edit_reply":
-        # Post draft in a thread for editing
-        eaccount_safe = meta.get("eaccount", "").replace("@", "[at]")
-        lead_email_safe = meta.get("lead_email", "").replace("@", "[at]")
+        eaccount = clean_slack_email(meta.get("eaccount", ""))
+        lead_email = clean_slack_email(meta.get("lead_email", ""))
+
         thread_meta = json.dumps({
             "reply_to_uuid": meta.get("reply_to_uuid"),
-            "eaccount": eaccount_safe,
+            "eaccount": eaccount,
             "subject": meta.get("subject", "Re:"),
-            "lead_email": lead_email_safe,
+            "lead_email": lead_email,
             "deal_id": meta.get("deal_id"),
+            "campaign_id": meta.get("campaign_id", ""),
         })
 
         text = (
@@ -370,9 +453,9 @@ def slack_actions():
             N8N_WEBHOOK_URL,
             json={
                 "reply_to_uuid": meta.get("reply_to_uuid"),
-                "eaccount": meta.get("eaccount"),
+                "eaccount": eaccount,
                 "subject": meta.get("subject", "Re:"),
-                "lead_email": meta.get("lead_email"),
+                "lead_email": lead_email,
                 "deal_id": meta.get("deal_id"),
                 "draft": meta.get("draft", ""),
                 "channel_id": channel_id,
@@ -380,16 +463,16 @@ def slack_actions():
                 "campaign_id": meta.get("campaign_id"),
             },
         )
-        print(f"[edit_reply] Forwarded to n8n for lead={meta.get('lead_email')}")
+        print(f"[edit_reply] Forwarded to n8n for lead={lead_email}")
         return "", 200
 
     elif action_id == "dismiss":
-        # Acknowledge dismissal
+        lead_email = clean_slack_email(meta.get("lead_email", ""))
         response_url = payload.get("response_url")
         if response_url:
             requests.post(response_url, json={
                 "replace_original": "true",
-                "text": f"\u274c Dismissed reply from {meta.get('lead_email', 'lead')}",
+                "text": f"\u274c Dismissed reply from {lead_email}",
             })
         return "", 200
 
@@ -443,19 +526,12 @@ def slack_events():
 
     meta = json.loads(meta_match.group(1))
 
-    # Clean up email addresses (Slack auto-links mailto:)
-    eaccount = meta.get("eaccount", "")
-    if "mailto:" in eaccount:
-        eaccount = eaccount.split("mailto:")[1].split("|")[0].strip()
-    eaccount = eaccount.replace("[at]", "@")
-
-    lead_email = meta.get("lead_email", "")
-    if "mailto:" in lead_email:
-        lead_email = lead_email.split("mailto:")[1].split("|")[0].strip()
-    lead_email = lead_email.replace("[at]", "@")
+    # Clean up all email fields using the universal cleaner
+    eaccount = clean_slack_email(meta.get("eaccount", ""))
+    lead_email = clean_slack_email(meta.get("lead_email", ""))
 
     # Forward edited reply to n8n
-    print(f"[slack_events] forwarding to n8n. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} body_preview={reply_text[:80]}")
+    print(f"[slack_events] forwarding to n8n. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
     requests.post(
         N8N_WEBHOOK_URL,
         json={
