@@ -254,13 +254,22 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
 def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
                          body: str, thread_html: str = "") -> dict:
     """Send a reply via Instantly with proper HTML threading."""
+    from datetime import datetime
+
     # Convert plain text newlines to HTML breaks
     html_body = body.replace("\n", "<br>")
 
-    # Wrap reply + append original thread HTML for proper threading
+    # Wrap reply + append original thread with proper gmail-style quoted divider
     full_html = f"<div>{html_body}</div>"
     if thread_html:
-        full_html += f"<br>{thread_html}"
+        timestamp = datetime.utcnow().strftime("%a, %b %d, %Y at %I:%M %p")
+        full_html += (
+            f'<br><div class="gmail_quote">'
+            f'<div dir="ltr" class="gmail_attr">On {timestamp} {eaccount} wrote:<br></div>'
+            f'<blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">'
+            f'{thread_html}'
+            f'</blockquote></div>'
+        )
 
     payload = {
         "reply_to_uuid": reply_to_uuid,
@@ -306,7 +315,17 @@ def incoming_reply():
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
 
     # Step 1: Resolve the reply_to_uuid + thread HTML from Instantly
-    reply_to_uuid, eaccount, thread_html = fetch_instantly_reply_uuid(campaign_id, lead_email)
+    # Retry once after 3 seconds if Instantly hasn't indexed the email yet
+    try:
+        reply_to_uuid, eaccount, thread_html = fetch_instantly_reply_uuid(campaign_id, lead_email)
+    except ValueError:
+        print(f"[incoming] No emails found on first try for {lead_email}. Retrying in 3s...")
+        time.sleep(3)
+        try:
+            reply_to_uuid, eaccount, thread_html = fetch_instantly_reply_uuid(campaign_id, lead_email)
+        except ValueError as e:
+            print(f"[incoming] Still no emails after retry for {lead_email}. Skipping. Error: {e}")
+            return jsonify({"status": "skipped", "reason": "no_emails_found"}), 200
 
     # Step 2: Extract sender name
     sender_name = extract_sender_name(eaccount)
