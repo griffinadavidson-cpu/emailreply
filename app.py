@@ -196,13 +196,12 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
 
 def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
     """
-    Hit GET /v2/emails with campaign_id, lead, and optionally eaccount.
-    Returns (reply_to_uuid, eaccount, thread_html, timestamp_email, from_address):
+    Hit GET /v2/emails with campaign_id and lead.
+    Returns (reply_to_uuid, eaccount, thread_html, wrote_line):
       - reply_to_uuid: id from index 0 (most recent email)
       - eaccount:      eaccount from last item (original outbound send)
       - thread_html:   HTML body from index 0 (for threading)
-      - timestamp_email: timestamp of most recent email
-      - from_address:  sender of most recent email
+      - wrote_line:    "On Day, Mon DD, YYYY at HH:MM AM/PM sender wrote:" extracted from body.text
     Raises if nothing comes back.
     """
     params = {
@@ -228,7 +227,6 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
 
     uuid = emails[0].get("id")
     eaccount = emails[-1].get("eaccount")
-    timestamp_email = emails[0].get("timestamp_email", "")
     # Who sent the most recent email (the one we're quoting)
     from_address = emails[0].get("from_address_email", emails[0].get("eaccount", ""))
 
@@ -236,35 +234,34 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
     body_obj = emails[0].get("body", {})
     if isinstance(body_obj, dict):
         thread_html = body_obj.get("html", "")
+        body_text = body_obj.get("text", "")
     else:
         thread_html = str(body_obj) if body_obj else ""
+        body_text = ""
+
+    # Extract the "On Day, Mon DD, YYYY at HH:MM AM/PM" timestamp from body.text
+    # This has the correct local timezone from the email client
+    wrote_line = ""
+    ts_match = re.search(r'(On\s+\w+,\s+\w+\s+\d+,\s+\d+\s+at\s+\d+:\d+\s*[APap][Mm])', body_text)
+    if ts_match:
+        wrote_line = f'{ts_match.group(1)} {from_address} wrote:'
+        print(f"[fetch_uuid] Extracted wrote_line from body.text: {wrote_line}")
+    else:
+        print(f"[fetch_uuid] Could not extract timestamp from body.text, will skip wrote line")
 
     print(f"[fetch_uuid] reply_to_uuid={uuid} eaccount={eaccount} thread_html_len={len(thread_html)} for {lead_email}")
-    return uuid, eaccount, thread_html, timestamp_email, from_address
+    return uuid, eaccount, thread_html, wrote_line
 
 
 def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
                          body: str, thread_html: str = "",
-                         timestamp_email: str = "", from_address: str = "") -> dict:
+                         wrote_line: str = "") -> dict:
     """Send a reply via Instantly with proper HTML threading."""
-    from datetime import datetime
-
     # Convert plain text newlines to HTML breaks
     html_body = body.replace("\n", "<br>")
 
     full_html = f"<div>{html_body}</div>"
     if thread_html:
-        # Format the timestamp from Instantly's timestamp_email field
-        wrote_line = ""
-        if timestamp_email:
-            try:
-                dt = datetime.fromisoformat(timestamp_email.replace("Z", "+00:00"))
-                formatted_ts = dt.strftime("%a, %b %d, %Y at %I:%M %p")
-                sender = from_address or eaccount
-                wrote_line = f'On {formatted_ts} {sender} wrote:'
-            except Exception:
-                wrote_line = ""
-
         if wrote_line:
             full_html += (
                 f'<br><div class="gmail_quote">'
@@ -318,12 +315,12 @@ def incoming_reply():
     # Step 1: Resolve the reply_to_uuid + thread HTML from Instantly
     # Retry once after 3 seconds if Instantly hasn't indexed the email yet
     try:
-        reply_to_uuid, eaccount, thread_html, timestamp_email, from_address = fetch_instantly_reply_uuid(campaign_id, lead_email)
+        reply_to_uuid, eaccount, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
     except ValueError:
         print(f"[incoming] No emails found on first try for {lead_email}. Retrying in 3s...")
         time.sleep(3)
         try:
-            reply_to_uuid, eaccount, thread_html, timestamp_email, from_address = fetch_instantly_reply_uuid(campaign_id, lead_email)
+            reply_to_uuid, eaccount, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
         except ValueError as e:
             print(f"[incoming] Still no emails after retry for {lead_email}. Skipping. Error: {e}")
             return jsonify({"status": "skipped", "reason": "no_emails_found"}), 200
@@ -350,8 +347,7 @@ def incoming_reply():
         "deal_id": deal_id,
         "draft": draft,
         "thread_html": thread_html,
-        "timestamp_email": timestamp_email,
-        "from_address": from_address,
+        "wrote_line": wrote_line,
     })
     meta_edit = json.dumps({
         "reply_to_uuid": reply_to_uuid,
@@ -438,13 +434,12 @@ def slack_actions():
     if action_id == "send_reply":
         draft = meta.get("draft", "")
         thread_html = meta.get("thread_html", "")
-        timestamp_email = meta.get("timestamp_email", "")
-        from_address = meta.get("from_address", "")
+        wrote_line = meta.get("wrote_line", "")
 
         # If thread_html was too large for Slack button, refetch it
         if meta.get("refetch_thread") and meta.get("campaign_id"):
             try:
-                _, _, thread_html, timestamp_email, from_address = fetch_instantly_reply_uuid(
+                _, _, thread_html, wrote_line = fetch_instantly_reply_uuid(
                     meta["campaign_id"], clean_slack_email(meta.get("lead_email", ""))
                 )
             except Exception as e:
@@ -469,8 +464,7 @@ def slack_actions():
                 subject=meta.get("subject", "Re:"),
                 body=draft,
                 thread_html=thread_html,
-                timestamp_email=timestamp_email,
-                from_address=from_address,
+                wrote_line=wrote_line,
             )
             print(f"[send_reply] Instantly response: {result}")
         else:
@@ -591,12 +585,11 @@ def slack_events():
         _sent_replies.add(dedup_key)
         # Fetch thread HTML for proper threading
         thread_html = ""
-        timestamp_email = ""
-        from_address = ""
+        wrote_line = ""
         campaign_id = meta.get("campaign_id", "")
         if campaign_id and lead_email:
             try:
-                _, _, thread_html, timestamp_email, from_address = fetch_instantly_reply_uuid(campaign_id, lead_email)
+                _, _, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
             except Exception as e:
                 print(f"[slack_events] Could not fetch thread_html: {e}")
 
@@ -606,8 +599,7 @@ def slack_events():
             subject=meta.get("subject", "Re:"),
             body=reply_text,
             thread_html=thread_html,
-            timestamp_email=timestamp_email,
-            from_address=from_address,
+            wrote_line=wrote_line,
         )
         print(f"[edit_send] Instantly response: {result}")
 
