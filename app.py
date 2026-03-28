@@ -22,6 +22,9 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# Track sent replies to prevent Slack event retries from sending duplicates
+_sent_replies = set()  # set of reply_to_uuid values that have already been sent
+
 
 # ============================================================
 # HELPERS
@@ -449,8 +452,16 @@ def slack_actions():
 
         eaccount = clean_slack_email(meta.get("eaccount", ""))
         lead_email = clean_slack_email(meta.get("lead_email", ""))
+        reply_uuid = meta.get("reply_to_uuid", "")
 
-        print(f"[slack_action] send_reply triggered. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} lead={lead_email}")
+        # Prevent duplicate sends
+        dedup_key = f"{reply_uuid}:send"
+        if dedup_key in _sent_replies:
+            print(f"[send_reply] Already sent for {dedup_key}. Skipping.")
+            return "", 200
+        _sent_replies.add(dedup_key)
+
+        print(f"[slack_action] send_reply triggered. reply_to_uuid={reply_uuid} eaccount={eaccount} lead={lead_email}")
         if meta.get("reply_to_uuid") and eaccount:
             result = send_instantly_reply(
                 reply_to_uuid=meta["reply_to_uuid"],
@@ -564,11 +575,20 @@ def slack_events():
     # Clean up all email fields using the universal cleaner
     eaccount = clean_slack_email(meta.get("eaccount", ""))
     lead_email = clean_slack_email(meta.get("lead_email", ""))
+    reply_uuid = meta.get("reply_to_uuid", "")
+
+    # Prevent duplicate sends from Slack event retries
+    dedup_key = f"{reply_uuid}:{thread_ts}"
+    if dedup_key in _sent_replies:
+        print(f"[slack_events] Already sent reply for {dedup_key}. Skipping.")
+        return "", 200
 
     # Send directly via Instantly (no n8n middleman)
-    print(f"[slack_events] Sending edited reply directly. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
+    print(f"[slack_events] Sending edited reply directly. reply_to_uuid={reply_uuid} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
 
     try:
+        # Mark as sent BEFORE sending to block concurrent retries
+        _sent_replies.add(dedup_key)
         # Fetch thread HTML for proper threading
         thread_html = ""
         timestamp_email = ""
