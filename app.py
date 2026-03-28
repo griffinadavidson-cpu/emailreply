@@ -254,22 +254,15 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
 def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
                          body: str, thread_html: str = "") -> dict:
     """Send a reply via Instantly with proper HTML threading."""
-    from datetime import datetime
-
     # Convert plain text newlines to HTML breaks
     html_body = body.replace("\n", "<br>")
 
-    # Wrap reply + append original thread with proper gmail-style quoted divider
+    # Wrap reply + append original thread
+    # thread_html from Instantly already contains proper timestamps and attribution
+    # so we just separate with a line break — no need to fabricate our own "On X wrote:" line
     full_html = f"<div>{html_body}</div>"
     if thread_html:
-        timestamp = datetime.utcnow().strftime("%a, %b %d, %Y at %I:%M %p")
-        full_html += (
-            f'<br><div class="gmail_quote">'
-            f'<div dir="ltr" class="gmail_attr">On {timestamp} {eaccount} wrote:<br></div>'
-            f'<blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">'
-            f'{thread_html}'
-            f'</blockquote></div>'
-        )
+        full_html += f"<br>{thread_html}"
 
     payload = {
         "reply_to_uuid": reply_to_uuid,
