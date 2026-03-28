@@ -448,22 +448,9 @@ def slack_actions():
 
         post_slack_chat(channel_id, message_ts, text)
 
-        # Forward to n8n for edit & send flow
-        requests.post(
-            N8N_WEBHOOK_URL,
-            json={
-                "reply_to_uuid": meta.get("reply_to_uuid"),
-                "eaccount": eaccount,
-                "subject": meta.get("subject", "Re:"),
-                "lead_email": lead_email,
-                "deal_id": meta.get("deal_id"),
-                "draft": meta.get("draft", ""),
-                "channel_id": channel_id,
-                "message_ts": message_ts,
-                "campaign_id": meta.get("campaign_id"),
-            },
-        )
-        print(f"[edit_reply] Forwarded to n8n for lead={lead_email}")
+        # Don't forward to n8n here — wait for user to reply in thread
+        # n8n webhook fires from /webhook/slack-events when user actually sends
+        print(f"[edit_reply] Posted draft to Slack thread for lead={lead_email}. Waiting for user reply.")
         return "", 200
 
     elif action_id == "dismiss":
