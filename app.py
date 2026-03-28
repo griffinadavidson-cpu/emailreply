@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import requests
 import anthropic
 from flask import Flask, request, jsonify
@@ -20,6 +21,25 @@ INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Dedup cache: skip if same lead_email was processed recently
+_recent_leads = {}  # {lead_email: timestamp}
+DEDUP_WINDOW = 21600  # 6 hours in seconds
+
+
+def is_duplicate_lead(lead_email: str) -> bool:
+    """Return True if this lead was already processed within the dedup window."""
+    now = time.time()
+    # Clean up old entries
+    expired = [k for k, v in _recent_leads.items() if now - v > DEDUP_WINDOW]
+    for k in expired:
+        del _recent_leads[k]
+    # Check if duplicate
+    if lead_email in _recent_leads:
+        print(f"[dedup] Skipping duplicate for {lead_email} (processed {now - _recent_leads[lead_email]:.1f}s ago)")
+        return True
+    _recent_leads[lead_email] = now
+    return False
 
 
 # ============================================================
@@ -272,6 +292,11 @@ def incoming_reply():
     body = data.get("body", data)  # support both nested and flat
 
     lead_email = str(body.get("lead_email", ""))
+
+    # Dedup: skip if this lead was already processed recently
+    if is_duplicate_lead(lead_email):
+        return jsonify({"status": "skipped", "reason": "duplicate"}), 200
+
     reply_snippet = body.get("reply_text_snippet", "")
     reply_text = body.get("reply_text", "")
     campaign_name = body.get("campaign_name", "")
@@ -517,21 +542,34 @@ def slack_events():
     eaccount = clean_slack_email(meta.get("eaccount", ""))
     lead_email = clean_slack_email(meta.get("lead_email", ""))
 
-    # Forward edited reply to n8n
-    print(f"[slack_events] forwarding to n8n. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
-    requests.post(
-        N8N_WEBHOOK_URL,
-        json={
-            "reply_to_uuid": meta.get("reply_to_uuid", ""),
-            "eaccount": eaccount,
-            "subject": meta.get("subject", "Re:"),
-            "lead_email": lead_email,
-            "deal_id": meta.get("deal_id", ""),
-            "edited_body": reply_text,
-            "campaign_id": meta.get("campaign_id", ""),
-        },
-    )
-    print(f"[edit_send] Sent edited reply to {lead_email}")
+    # Send directly via Instantly (no n8n middleman)
+    print(f"[slack_events] Sending edited reply directly. reply_to_uuid={meta.get('reply_to_uuid')} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
+
+    try:
+        # Fetch thread HTML for proper threading
+        thread_html = ""
+        campaign_id = meta.get("campaign_id", "")
+        if campaign_id and lead_email:
+            try:
+                _, _, thread_html = fetch_instantly_reply_uuid(campaign_id, lead_email)
+            except Exception as e:
+                print(f"[slack_events] Could not fetch thread_html: {e}")
+
+        result = send_instantly_reply(
+            reply_to_uuid=meta.get("reply_to_uuid", ""),
+            eaccount=eaccount,
+            subject=meta.get("subject", "Re:"),
+            body=reply_text,
+            thread_html=thread_html,
+        )
+        print(f"[edit_send] Instantly response: {result}")
+
+        # Confirm in Slack thread
+        post_slack_chat(channel, thread_ts, f"\u2705 Reply sent to {lead_email}")
+
+    except Exception as e:
+        print(f"[edit_send] Failed to send reply: {e}")
+        post_slack_chat(channel, thread_ts, f"\u274c Failed to send reply: {str(e)}")
 
     return "", 200
 
