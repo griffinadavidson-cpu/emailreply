@@ -142,18 +142,19 @@ def get_calendly_info(email_account: str, campaign_name: str = "") -> dict:
     return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
 
 
-def fetch_available_slots(event_type_uri: str, num_slots: int = 5) -> list:
-    """Fetch available time slots from Calendly for the next 5 business days.
+def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
+    """Fetch available time slots from Calendly, grouped by day.
 
-    Returns a list of dicts: [{"start_time": "...", "scheduling_url": "...", "display": "..."}]
-    Picks slots spread across different days for variety.
+    Returns an OrderedDict-style dict:
+      {"Tuesday, March 31": [{"time": "9:00 am", "url": "..."}, ...], ...}
+    Shows all slots for the next `num_days` available days.
     """
     if not event_type_uri or not CALENDLY_API_KEY:
-        return []
+        return {}
 
     now = datetime.now(timezone.utc)
     start = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = (now + timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
         resp = requests.get(
@@ -169,77 +170,59 @@ def fetch_available_slots(event_type_uri: str, num_slots: int = 5) -> list:
         all_slots = resp.json().get("collection", [])
     except Exception as e:
         print(f"[calendly] Failed to fetch available times: {e}")
-        return []
+        return {}
 
     if not all_slots:
-        return []
+        return {}
 
-    # Spread slots across different days for variety
-    slots_by_day = {}
+    # Group all available slots by day (in ET)
+    days = {}  # day_label -> [{"time": "9:00 am", "url": "..."}]
     for slot in all_slots:
         if slot.get("status") != "available":
             continue
         dt = datetime.fromisoformat(slot["start_time"].replace("Z", "+00:00"))
-        day_key = dt.strftime("%Y-%m-%d")
-        if day_key not in slots_by_day:
-            slots_by_day[day_key] = []
-        slots_by_day[day_key].append(slot)
+        et_dt = dt - timedelta(hours=4)  # approximate ET
+        day_label = f"{et_dt.strftime('%A')}, {et_dt.strftime('%B')} {et_dt.day}"
+        time_label = et_dt.strftime("%I:%M %p").lstrip("0").lower()
+        if day_label not in days:
+            days[day_label] = []
+        days[day_label].append({
+            "time": time_label,
+            "url": slot["scheduling_url"],
+        })
 
-    # Pick 1-2 slots per day until we have enough
-    selected = []
-    for day_key in sorted(slots_by_day.keys()):
-        day_slots = slots_by_day[day_key]
-        # Pick a morning-ish and afternoon-ish slot if available
-        picks = []
-        for s in day_slots:
-            dt = datetime.fromisoformat(s["start_time"].replace("Z", "+00:00"))
-            hour_et = (dt.hour - 4) % 24  # rough ET offset
-            if not picks:
-                picks.append(s)
-            elif hour_et >= 14 and len(picks) == 1:
-                picks.append(s)
-                break
-        for s in picks:
-            dt = datetime.fromisoformat(s["start_time"].replace("Z", "+00:00"))
-            # Format for display in ET (UTC-4 approx)
-            et_dt = dt - timedelta(hours=4)
-            day_num = et_dt.day
-            hour_12 = et_dt.strftime("%I:%M %p").lstrip("0")
-            display = f"{et_dt.strftime('%A, %B')} {day_num} at {hour_12} ET"
-            selected.append({
-                "start_time": s["start_time"],
-                "scheduling_url": s["scheduling_url"],
-                "display": display,
-            })
-            if len(selected) >= num_slots:
-                break
-        if len(selected) >= num_slots:
-            break
-
-    print(f"[calendly] Fetched {len(selected)} slots from {len(all_slots)} available times")
-    return selected
+    # Keep only the first num_days available days
+    sorted_days = dict(list(days.items())[:num_days])
+    total = sum(len(v) for v in sorted_days.values())
+    print(f"[calendly] Fetched {total} slots across {len(sorted_days)} days from {len(all_slots)} total available")
+    return sorted_days
 
 
-def format_slots_for_email(slots: list, fallback_url: str) -> str:
-    """Format available slots as a text block for inclusion in email drafts."""
-    if not slots:
+def format_slots_for_email(slots_by_day: dict, fallback_url: str) -> str:
+    """Format grouped slots as a text block for email drafts (Calendly style)."""
+    if not slots_by_day:
         return f"Book a time that works for you here: {fallback_url}"
 
-    lines = ["Here are some times that work for a quick call:\n"]
-    for i, slot in enumerate(slots, 1):
-        lines.append(f"  {i}. {slot['display']} — {slot['scheduling_url']}")
-    lines.append(f"\nDon't see a time that works? Pick any open slot here: {fallback_url}")
+    lines = []
+    for day_label, times in slots_by_day.items():
+        lines.append(f"{day_label}")
+        time_strs = [f"{t['time']} - {t['url']}" for t in times]
+        lines.append("  " + "  |  ".join(time_strs))
+        lines.append("")
+    lines.append(f"Don't see a time that works? Pick any open slot here: {fallback_url}")
     return "\n".join(lines)
 
 
-def format_slots_for_slack(slots: list, fallback_url: str) -> str:
-    """Format available slots as a Slack mrkdwn block."""
-    if not slots:
+def format_slots_for_slack(slots_by_day: dict, fallback_url: str) -> str:
+    """Format grouped slots as a Slack mrkdwn block (Calendly style)."""
+    if not slots_by_day:
         return f"<{fallback_url}|Book a time>"
 
     lines = []
-    for i, slot in enumerate(slots, 1):
-        lines.append(f"{i}. {slot['display']} — <{slot['scheduling_url']}|Book>")
+    for day_label, times in slots_by_day.items():
+        lines.append(f"*{day_label}*")
+        time_strs = [f"<{t['url']}|{t['time']}>" for t in times]
+        lines.append("  " + "  |  ".join(time_strs))
     lines.append(f"\n<{fallback_url}|See all available times>")
     return "\n".join(lines)
 
@@ -472,7 +455,7 @@ def incoming_reply():
     scheduling_block = format_slots_for_email(available_slots, cal_info["fallback_url"])
     slack_slots_text = format_slots_for_slack(available_slots, cal_info["fallback_url"])
     draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text, scheduling_block)
-    print(f"[draft] Generated {len(draft)} chars for {lead_email} ({len(available_slots)} slots fetched)")
+    print(f"[draft] Generated {len(draft)} chars for {lead_email} ({len(available_slots)} days of slots fetched)")
 
     # Step 5: Build Slack message with action buttons
     meta_send = json.dumps({
