@@ -19,6 +19,8 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
+CALENDLY_O2E_URL = os.getenv("CALENDLY_O2E_URL", "https://calendly.com/gdavidson-options2exit/introcall")
+CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/PLACEHOLDER-state17/meeting")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -70,7 +72,8 @@ def classify_reply(reply_snippet: str) -> str:
 
 
 def draft_reply(sender_name: str, email_account: str, lead_email: str,
-                campaign_name: str, reply_text: str) -> str:
+                campaign_name: str, reply_text: str,
+                calendly_link: str = "") -> str:
     """Use Claude Haiku to draft an email reply for INTERESTED leads."""
     prompt = f"""You are an AI assistant helping draft email replies for an M&A outreach campaign.
 
@@ -98,6 +101,8 @@ Write a short, professional reply under 120 words that directly addresses what t
 - If they asked what you do → explain clearly based on which company you represent, then move toward a call
 - If they asked a specific question → answer it accurately based on the correct company context, then advance the conversation
 
+CALENDAR LINK — ALWAYS include this scheduling link in every reply. Work it naturally into the response (e.g., "Feel free to grab a time that works for you here: {calendly_link}" or "Here's my calendar if you'd like to book a quick call: {calendly_link}"). Place it near the end of the reply, before the sign-off.
+
 Sign off with this name exactly: {sender_name}
 Do not include a subject line or any "Subject:" prefix. Output only the reply body.
 
@@ -110,6 +115,17 @@ Full email thread: {reply_text}"""
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text.strip()
+
+
+def get_calendly_link(email_account: str, campaign_name: str = "") -> str:
+    """Return the correct Calendly link based on sending email domain or campaign name."""
+    combined = (email_account + " " + campaign_name).lower()
+    if any(kw in combined for kw in ("options2exit", "o2e")):
+        return CALENDLY_O2E_URL
+    if any(kw in combined for kw in ("state17", "findstate17", "state 17")):
+        return CALENDLY_STATE17_URL
+    # Default fallback — check domain
+    return CALENDLY_STATE17_URL
 
 
 def extract_sender_name(email_account: str) -> str:
@@ -334,9 +350,10 @@ def incoming_reply():
     deal = create_attio_deal(lead_email)
     deal_id = deal["data"]["id"]["record_id"]
 
-    # Step 4: Draft reply with Claude
-    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text)
-    print(f"[draft] Generated {len(draft)} chars for {lead_email}")
+    # Step 4: Resolve calendar link and draft reply with Claude
+    calendly_link = get_calendly_link(eaccount, campaign_name)
+    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text, calendly_link)
+    print(f"[draft] Generated {len(draft)} chars for {lead_email} (calendly={calendly_link})")
 
     # Step 5: Build Slack message with action buttons
     meta_send = json.dumps({
@@ -394,7 +411,8 @@ def incoming_reply():
             f"\U0001f514 *New Interested Reply*\n"
             f"*Campaign:* {campaign_name}\n"
             f"*Sender:* {eaccount}\n"
-            f"*Lead:* {lead_email}"}},
+            f"*Lead:* {lead_email}\n"
+            f"*Calendar:* {calendly_link}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*Lead's Reply:*\n{reply_snippet}"}},
