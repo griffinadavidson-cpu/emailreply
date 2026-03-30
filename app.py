@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 import requests
 import anthropic
 from flask import Flask, request, jsonify
@@ -19,6 +20,14 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
+CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
+# Event type URIs from Calendly (found via GET /event_types)
+CALENDLY_O2E_EVENT_TYPE = os.getenv(
+    "CALENDLY_O2E_EVENT_TYPE",
+    "https://api.calendly.com/event_types/fcf75643-7fb6-4072-b1e0-5dba5ce49c1d",
+)
+CALENDLY_STATE17_EVENT_TYPE = os.getenv("CALENDLY_STATE17_EVENT_TYPE", "")
+# Fallback booking page URLs (used when API fails or event type not configured)
 CALENDLY_O2E_URL = os.getenv("CALENDLY_O2E_URL", "https://calendly.com/gdavidson-options2exit/introcall")
 CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/PLACEHOLDER-state17/meeting")
 
@@ -73,7 +82,7 @@ def classify_reply(reply_snippet: str) -> str:
 
 def draft_reply(sender_name: str, email_account: str, lead_email: str,
                 campaign_name: str, reply_text: str,
-                calendly_link: str = "") -> str:
+                scheduling_block: str = "") -> str:
     """Use Claude Haiku to draft an email reply for INTERESTED leads."""
     prompt = f"""You are an AI assistant helping draft email replies for an M&A outreach campaign.
 
@@ -101,7 +110,9 @@ Write a short, professional reply under 120 words that directly addresses what t
 - If they asked what you do → explain clearly based on which company you represent, then move toward a call
 - If they asked a specific question → answer it accurately based on the correct company context, then advance the conversation
 
-CALENDAR LINK — ALWAYS include this scheduling link in every reply. Work it naturally into the response (e.g., "Feel free to grab a time that works for you here: {calendly_link}" or "Here's my calendar if you'd like to book a quick call: {calendly_link}"). Place it near the end of the reply, before the sign-off.
+SCHEDULING — ALWAYS include the following scheduling block at the end of your reply, right before the sign-off. Copy it EXACTLY as provided (do not rephrase the times or URLs). Lead into it naturally with one short sentence like "I'd love to connect — here are a few times that work:" or "Happy to chat — pick a time that works for you:".
+
+{scheduling_block}
 
 Sign off with this name exactly: {sender_name}
 Do not include a subject line or any "Subject:" prefix. Output only the reply body.
@@ -117,15 +128,120 @@ Full email thread: {reply_text}"""
     return msg.content[0].text.strip()
 
 
-def get_calendly_link(email_account: str, campaign_name: str = "") -> str:
-    """Return the correct Calendly link based on sending email domain or campaign name."""
+def get_calendly_info(email_account: str, campaign_name: str = "") -> dict:
+    """Return the correct Calendly event type URI and fallback URL based on domain."""
     combined = (email_account + " " + campaign_name).lower()
     if any(kw in combined for kw in ("options2exit", "o2e")):
-        return CALENDLY_O2E_URL
+        return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
     if any(kw in combined for kw in ("state17", "findstate17", "state 17")):
-        return CALENDLY_STATE17_URL
-    # Default fallback — check domain
-    return CALENDLY_STATE17_URL
+        # Fall back to O2E if State17 isn't configured yet
+        if CALENDLY_STATE17_EVENT_TYPE:
+            return {"event_type": CALENDLY_STATE17_EVENT_TYPE, "fallback_url": CALENDLY_STATE17_URL}
+        return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
+    # Default to O2E
+    return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
+
+
+def fetch_available_slots(event_type_uri: str, num_slots: int = 5) -> list:
+    """Fetch available time slots from Calendly for the next 5 business days.
+
+    Returns a list of dicts: [{"start_time": "...", "scheduling_url": "...", "display": "..."}]
+    Picks slots spread across different days for variety.
+    """
+    if not event_type_uri or not CALENDLY_API_KEY:
+        return []
+
+    now = datetime.now(timezone.utc)
+    start = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        resp = requests.get(
+            "https://api.calendly.com/event_type_available_times",
+            headers={"Authorization": f"Bearer {CALENDLY_API_KEY}"},
+            params={
+                "event_type": event_type_uri,
+                "start_time": start,
+                "end_time": end,
+            },
+        )
+        resp.raise_for_status()
+        all_slots = resp.json().get("collection", [])
+    except Exception as e:
+        print(f"[calendly] Failed to fetch available times: {e}")
+        return []
+
+    if not all_slots:
+        return []
+
+    # Spread slots across different days for variety
+    slots_by_day = {}
+    for slot in all_slots:
+        if slot.get("status") != "available":
+            continue
+        dt = datetime.fromisoformat(slot["start_time"].replace("Z", "+00:00"))
+        day_key = dt.strftime("%Y-%m-%d")
+        if day_key not in slots_by_day:
+            slots_by_day[day_key] = []
+        slots_by_day[day_key].append(slot)
+
+    # Pick 1-2 slots per day until we have enough
+    selected = []
+    for day_key in sorted(slots_by_day.keys()):
+        day_slots = slots_by_day[day_key]
+        # Pick a morning-ish and afternoon-ish slot if available
+        picks = []
+        for s in day_slots:
+            dt = datetime.fromisoformat(s["start_time"].replace("Z", "+00:00"))
+            hour_et = (dt.hour - 4) % 24  # rough ET offset
+            if not picks:
+                picks.append(s)
+            elif hour_et >= 14 and len(picks) == 1:
+                picks.append(s)
+                break
+        for s in picks:
+            dt = datetime.fromisoformat(s["start_time"].replace("Z", "+00:00"))
+            # Format for display in ET (UTC-4 approx)
+            et_dt = dt - timedelta(hours=4)
+            day_num = et_dt.day
+            hour_12 = et_dt.strftime("%I:%M %p").lstrip("0")
+            display = f"{et_dt.strftime('%A, %B')} {day_num} at {hour_12} ET"
+            selected.append({
+                "start_time": s["start_time"],
+                "scheduling_url": s["scheduling_url"],
+                "display": display,
+            })
+            if len(selected) >= num_slots:
+                break
+        if len(selected) >= num_slots:
+            break
+
+    print(f"[calendly] Fetched {len(selected)} slots from {len(all_slots)} available times")
+    return selected
+
+
+def format_slots_for_email(slots: list, fallback_url: str) -> str:
+    """Format available slots as a text block for inclusion in email drafts."""
+    if not slots:
+        return f"Book a time that works for you here: {fallback_url}"
+
+    lines = ["Here are some times that work for a quick call:\n"]
+    for i, slot in enumerate(slots, 1):
+        lines.append(f"  {i}. {slot['display']} — {slot['scheduling_url']}")
+    lines.append(f"\nDon't see a time that works? Pick any open slot here: {fallback_url}")
+    return "\n".join(lines)
+
+
+def format_slots_for_slack(slots: list, fallback_url: str) -> str:
+    """Format available slots as a Slack mrkdwn block."""
+    if not slots:
+        return f"<{fallback_url}|Book a time>"
+
+    lines = []
+    for i, slot in enumerate(slots, 1):
+        lines.append(f"{i}. {slot['display']} — <{slot['scheduling_url']}|Book>")
+    lines.append(f"\n<{fallback_url}|See all available times>")
+    return "\n".join(lines)
 
 
 def extract_sender_name(email_account: str) -> str:
@@ -350,10 +466,13 @@ def incoming_reply():
     deal = create_attio_deal(lead_email)
     deal_id = deal["data"]["id"]["record_id"]
 
-    # Step 4: Resolve calendar link and draft reply with Claude
-    calendly_link = get_calendly_link(eaccount, campaign_name)
-    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text, calendly_link)
-    print(f"[draft] Generated {len(draft)} chars for {lead_email} (calendly={calendly_link})")
+    # Step 4: Fetch available Calendly slots and draft reply with Claude
+    cal_info = get_calendly_info(eaccount, campaign_name)
+    available_slots = fetch_available_slots(cal_info["event_type"])
+    scheduling_block = format_slots_for_email(available_slots, cal_info["fallback_url"])
+    slack_slots_text = format_slots_for_slack(available_slots, cal_info["fallback_url"])
+    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text, scheduling_block)
+    print(f"[draft] Generated {len(draft)} chars for {lead_email} ({len(available_slots)} slots fetched)")
 
     # Step 5: Build Slack message with action buttons
     meta_send = json.dumps({
@@ -411,11 +530,13 @@ def incoming_reply():
             f"\U0001f514 *New Interested Reply*\n"
             f"*Campaign:* {campaign_name}\n"
             f"*Sender:* {eaccount}\n"
-            f"*Lead:* {lead_email}\n"
-            f"*Calendar:* {calendly_link}"}},
+            f"*Lead:* {lead_email}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*Lead's Reply:*\n{reply_snippet}"}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text":
+            f"*Available Time Slots:*\n{slack_slots_text}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*AI Draft:*\n{draft}"}},
