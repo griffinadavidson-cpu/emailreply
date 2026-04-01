@@ -62,11 +62,53 @@ def clean_slack_email(email: str) -> str:
     return email
 
 
+def extract_lead_response(reply_text: str, reply_snippet: str, campaign_name: str) -> str:
+    """Use Claude to extract the lead's most recent complete response from an email thread."""
+    if not reply_text:
+        return reply_snippet
+
+    prompt = f"""You are an email thread parser. You will receive a full email thread in HTML format.
+
+This thread is from an outbound sales campaign. Our brand is either "State17" or "Options2Exit" (also abbreviated O2E). Our sending domains include: state17.com, findstate17.com, options2exit.com, and any email address associated with those brands.
+
+The campaign name is: {campaign_name}
+
+Your job: Extract ONLY the lead's most recent response. The lead is the person who is NOT from our brands. Their reply is the newest message in the thread that was NOT sent by us.
+
+Rules:
+- Strip all HTML tags and return clean plain text only
+- Do NOT include any quoted replies, forwarded content, or prior messages
+- Do NOT include any "On [date] [person] wrote:" lines
+- Do NOT include our original outbound email or any part of it
+- Do NOT include email signatures from our team
+- If the lead's response includes their own signature (name, title, phone), keep it
+- Return ONLY the lead's message text, nothing else
+- No labels, no headers, no explanations. Just the raw message content.
+
+Here is the full email thread:
+
+{reply_text}"""
+
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        extracted = msg.content[0].text.strip()
+        if extracted and len(extracted) > 2:
+            print(f"[extract] Successfully extracted lead response: {len(extracted)} chars")
+            return extracted
+        print(f"[extract] Extraction returned empty/short result, falling back to snippet")
+        return reply_snippet
+    except Exception as e:
+        print(f"[extract] Failed to extract lead response: {e}. Falling back to snippet.")
+        return reply_snippet
+
+
 def draft_reply(sender_name: str, eaccount: str, lead_email: str,
                 campaign_name: str, reply_text: str) -> str:
     """Use Claude to draft an email reply."""
-    # Finalized system prompt text (keeps placeholders intact). Stored as a
-    # raw triple-quoted string to avoid accidental formatting of braces.
     prompt = """
 # SYSTEM PROMPT: Email Reply Engine for State17 & Options2Exit
 
@@ -151,7 +193,7 @@ Never say "Please use the following link to schedule." That sounds automated.
 Read every inbound reply and classify it into ONE of the following categories. Then follow the corresponding action.
 
 ### CATEGORY 1: INTERESTED / READY TO BOOK
-**Signals:** "sure," "I am interested," "let's talk," "sounds good," "I am free," "yes," "I would be interested," "tell me more," "what is the best way to connect," "when works," "let's schedule a call," "tomorrow works," "call me at [number]," "I can do [time]," prospect proposes a meeting time, prospect shares their phone number
+**Signals:** "sure," "I am interested," "let's talk," "sounds good," "I am free," "yes," "I would be interested," "tell me more," "what is the best way to connect," "when works," "let's schedule a call," "tomorrow works," "call me at [number]," prospect proposes a meeting time, prospect shares their phone number
 
 **Action:** Respond. Keep it short. Get them to the calendar link or confirm a time. Do not re-pitch. They already said yes.
 
@@ -160,8 +202,6 @@ Read every inbound reply and classify it into ONE of the following categories. T
 - If they propose a time: "That works. I will give you a call then. Looking forward to it."
 - If they share a phone number: "Got it. I will call you at [number]. Does [tomorrow/today] work or is there a better day?"
 - If they say "tell me more": Give 2-3 sentences of context (not a pitch), then steer to the call. "Happy to walk you through it. Easiest thing would be a quick 15 minute call. Here is my calendar: [link]"
-
-... (prompt continues exactly as provided by the user; include full rules, scenarios, and output format) ...
 
 ## OUTPUT FORMAT
 
@@ -197,7 +237,6 @@ If the reply should NOT receive a response, output only: NO RESPONSE
 10. Read the original outbound email carefully. Do not contradict anything that was said in it.
 """
 
-    # Append signing/campaign metadata and the email thread
     full_prompt = (
         prompt
         + "\n\nSign off with this name exactly: "
@@ -222,21 +261,14 @@ def get_calendly_info(email_account: str, campaign_name: str = "") -> dict:
     if any(kw in combined for kw in ("options2exit", "o2e")):
         return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
     if any(kw in combined for kw in ("state17", "findstate17", "state 17")):
-        # Fall back to O2E if State17 isn't configured yet
         if CALENDLY_STATE17_EVENT_TYPE:
             return {"event_type": CALENDLY_STATE17_EVENT_TYPE, "fallback_url": CALENDLY_STATE17_URL}
         return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
-    # Default to O2E
     return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
 
 
 def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
-    """Fetch available time slots from Calendly, grouped by day.
-
-    Returns an OrderedDict-style dict:
-      {"Tuesday, March 31": [{"time": "9:00 am", "url": "..."}, ...], ...}
-    Shows all slots for the next `num_days` available days.
-    """
+    """Fetch available time slots from Calendly, grouped by day."""
     if not event_type_uri or not CALENDLY_API_KEY:
         return {}
 
@@ -263,13 +295,12 @@ def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
     if not all_slots:
         return {}
 
-    # Group all available slots by day (in ET)
-    days = {}  # day_label -> [{"time": "9:00 am", "url": "..."}]
+    days = {}
     for slot in all_slots:
         if slot.get("status") != "available":
             continue
         dt = datetime.fromisoformat(slot["start_time"].replace("Z", "+00:00"))
-        et_dt = dt - timedelta(hours=4)  # approximate ET
+        et_dt = dt - timedelta(hours=4)
         day_label = f"{et_dt.strftime('%A')}, {et_dt.strftime('%B')} {et_dt.day}"
         time_label = et_dt.strftime("%I:%M %p").lstrip("0").lower()
         if day_label not in days:
@@ -279,7 +310,6 @@ def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
             "url": slot["scheduling_url"],
         })
 
-    # Keep only the first num_days available days
     sorted_days = dict(list(days.items())[:num_days])
     total = sum(len(v) for v in sorted_days.values())
     print(f"[calendly] Fetched {total} slots across {len(sorted_days)} days from {len(all_slots)} total available")
@@ -287,7 +317,7 @@ def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
 
 
 def format_slots_for_email(slots_by_day: dict, fallback_url: str) -> str:
-    """Format grouped slots as a text block for email drafts (Calendly style)."""
+    """Format grouped slots as a text block for email drafts."""
     if not slots_by_day:
         return f"Book a time that works for you here: {fallback_url}"
 
@@ -302,7 +332,7 @@ def format_slots_for_email(slots_by_day: dict, fallback_url: str) -> str:
 
 
 def format_slots_for_slack(slots_by_day: dict, fallback_url: str) -> str:
-    """Format grouped slots as a Slack mrkdwn block (Calendly style)."""
+    """Format grouped slots as a Slack mrkdwn block."""
     if not slots_by_day:
         return f"<{fallback_url}|Book a time>"
 
@@ -316,7 +346,7 @@ def format_slots_for_slack(slots_by_day: dict, fallback_url: str) -> str:
 
 
 def extract_sender_name(email_account: str) -> str:
-    """Extract first name from email, e.g. john.tanner@x.com → John"""
+    """Extract first name from email, e.g. john.tanner@x.com -> John"""
     local = email_account.split("@")[0]
     first = local.split(".")[0]
     return first.capitalize()
@@ -400,12 +430,7 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
 def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
     """
     Hit GET /v2/emails with campaign_id and lead.
-    Returns (reply_to_uuid, eaccount, thread_html, wrote_line):
-      - reply_to_uuid: id from index 0 (most recent email)
-      - eaccount:      eaccount from last item (original outbound send)
-      - thread_html:   HTML body from index 0 (for threading)
-      - wrote_line:    "On Day, Mon DD, YYYY at HH:MM AM/PM sender wrote:" extracted from body.text
-    Raises if nothing comes back.
+    Returns (reply_to_uuid, eaccount, thread_html, wrote_line).
     """
     params = {
         "lead": lead_email,
@@ -430,10 +455,8 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
 
     uuid = emails[0].get("id")
     eaccount = emails[-1].get("eaccount")
-    # Who sent the most recent email (the one we're quoting)
     from_address = emails[0].get("from_address_email", emails[0].get("eaccount", ""))
 
-    # Grab thread HTML for proper email threading
     body_obj = emails[0].get("body", {})
     if isinstance(body_obj, dict):
         thread_html = body_obj.get("html", "")
@@ -442,8 +465,6 @@ def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
         thread_html = str(body_obj) if body_obj else ""
         body_text = ""
 
-    # Extract the "On Day, Mon DD, YYYY at HH:MM AM/PM" timestamp from body.text
-    # This has the correct local timezone from the email client
     wrote_line = ""
     ts_match = re.search(r'(On\s+\w+,\s+\w+\s+\d+,\s+\d+\s+at\s+\d+:\d+\s*[APap][Mm])', body_text)
     if ts_match:
@@ -460,7 +481,6 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
                          body: str, thread_html: str = "",
                          wrote_line: str = "") -> dict:
     """Send a reply via Instantly with proper HTML threading."""
-    # Convert plain text newlines to HTML breaks
     html_body = body.replace("\n", "<br>")
 
     full_html = f"<div>{html_body}</div>"
@@ -503,7 +523,7 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
 @app.route("/webhook/incoming", methods=["POST"])
 def incoming_reply():
     data = request.json
-    body = data.get("body", data)  # support both nested and flat
+    body = data.get("body", data)
 
     lead_email = str(body.get("lead_email", ""))
 
@@ -515,8 +535,10 @@ def incoming_reply():
     subject = body.get("reply_subject") or body.get("subject") or "Re:"
     domain = lead_email.split("@")[1] if "@" in lead_email else ""
 
+    # Extract clean lead response for Slack display
+    lead_response = extract_lead_response(reply_text, reply_snippet, campaign_name)
+
     # Step 1: Resolve the reply_to_uuid + thread HTML from Instantly
-    # Retry once after 3 seconds if Instantly hasn't indexed the email yet
     try:
         reply_to_uuid, eaccount, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
     except ValueError:
@@ -571,8 +593,6 @@ def incoming_reply():
         "lead_email": lead_email,
     })
 
-    # Check if meta payloads exceed Slack's 2000 char limit for button values
-    # If thread_html is too large, store it separately and skip in meta
     if len(meta_send) > 1900 or len(meta_edit) > 1900:
         print(f"[warn] Meta payload too large for Slack buttons (send={len(meta_send)}, edit={len(meta_edit)}). Dropping thread_html from button meta.")
         meta_send = json.dumps({
@@ -604,7 +624,7 @@ def incoming_reply():
             f"*Lead:* {lead_email}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
-            f"*Lead's Reply:*\n{reply_snippet}"}},
+            f"*Lead's Reply:*\n{lead_response}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*Available Time Slots:*\n{slack_slots_text}"}},
@@ -646,7 +666,6 @@ def slack_actions():
         thread_html = meta.get("thread_html", "")
         wrote_line = meta.get("wrote_line", "")
 
-        # If thread_html was too large for Slack button, refetch it
         if meta.get("refetch_thread") and meta.get("campaign_id"):
             try:
                 _, _, thread_html, wrote_line = fetch_instantly_reply_uuid(
@@ -659,7 +678,6 @@ def slack_actions():
         lead_email = clean_slack_email(meta.get("lead_email", ""))
         reply_uuid = meta.get("reply_to_uuid", "")
 
-        # Prevent duplicate sends
         dedup_key = f"{reply_uuid}:send"
         if dedup_key in _sent_replies:
             print(f"[send_reply] Already sent for {dedup_key}. Skipping.")
@@ -678,9 +696,8 @@ def slack_actions():
             )
             print(f"[send_reply] Instantly response: {result}")
         else:
-            print(f"[send_reply] SKIPPED — missing reply_to_uuid or eaccount. meta keys: {list(meta.keys())}")
+            print(f"[send_reply] SKIPPED -- missing reply_to_uuid or eaccount. meta keys: {list(meta.keys())}")
 
-        # Acknowledge in Slack via response_url
         response_url = payload.get("response_url")
         if response_url:
             requests.post(response_url, json={
@@ -711,8 +728,6 @@ def slack_actions():
 
         post_slack_chat(channel_id, message_ts, text)
 
-        # Don't forward to n8n here — wait for user to reply in thread
-        # n8n webhook fires from /webhook/slack-events when user actually sends
         print(f"[edit_reply] Posted draft to Slack thread for lead={lead_email}. Waiting for user reply.")
         return "", 200
 
@@ -737,30 +752,25 @@ def slack_actions():
 def slack_events():
     data = request.json
 
-    # Handle Slack URL verification challenge
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]}), 200
 
     event = data.get("event", {})
 
-    # Ignore bot messages and non-thread messages
     if event.get("bot_id") or not event.get("thread_ts"):
         return "", 200
 
     thread_ts = event["thread_ts"]
     channel = event["channel"]
 
-    # Fetch the thread to find the META data and the user's edited reply
     thread = fetch_slack_thread(channel, thread_ts)
     messages = thread.get("messages", [])
 
-    # Get the last human (non-bot) message as the edited reply
     human_messages = [m for m in messages if not m.get("bot_id") and m.get("subtype") != "bot_message" and "META:" not in m.get("text", "")]
     if not human_messages:
         return "", 200
     reply_text = human_messages[-1].get("text", "")
 
-    # Find the META message
     meta_message = None
     for m in reversed(messages):
         if m.get("text") and "META:" in m["text"]:
@@ -776,24 +786,19 @@ def slack_events():
 
     meta = json.loads(meta_match.group(1))
 
-    # Clean up all email fields using the universal cleaner
     eaccount = clean_slack_email(meta.get("eaccount", ""))
     lead_email = clean_slack_email(meta.get("lead_email", ""))
     reply_uuid = meta.get("reply_to_uuid", "")
 
-    # Prevent duplicate sends from Slack event retries
     dedup_key = f"{reply_uuid}:{thread_ts}"
     if dedup_key in _sent_replies:
         print(f"[slack_events] Already sent reply for {dedup_key}. Skipping.")
         return "", 200
 
-    # Send directly via Instantly (no n8n middleman)
     print(f"[slack_events] Sending edited reply directly. reply_to_uuid={reply_uuid} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
 
     try:
-        # Mark as sent BEFORE sending to block concurrent retries
         _sent_replies.add(dedup_key)
-        # Fetch thread HTML for proper threading
         thread_html = ""
         wrote_line = ""
         campaign_id = meta.get("campaign_id", "")
@@ -813,7 +818,6 @@ def slack_events():
         )
         print(f"[edit_send] Instantly response: {result}")
 
-        # Confirm in Slack thread
         post_slack_chat(channel, thread_ts, f"\u2705 Reply sent to {lead_email}")
 
     except Exception as e:
