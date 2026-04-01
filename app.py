@@ -135,8 +135,8 @@ Match the formality of the original signature. If they used just a first name, u
 
 Use the correct link based on the campaign:
 
-- **State17 replies:** [STATE17_CALENDAR_LINK_PLACEHOLDER]
-- **Options2Exit replies:** [O2E_CALENDAR_LINK_PLACEHOLDER]
+- **State17 replies:** """ + CALENDLY_STATE17_URL + """
+- **Options2Exit replies:** """ + CALENDLY_O2E_URL + """
 
 When dropping a calendar link, keep it casual. Examples:
 - "Here is my calendar if you want to grab a time: [link]"
