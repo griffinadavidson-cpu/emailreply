@@ -63,8 +63,7 @@ def clean_slack_email(email: str) -> str:
 
 
 def draft_reply(sender_name: str, eaccount: str, lead_email: str,
-                campaign_name: str, reply_text: str,
-                scheduling_block: str = "") -> str:
+                campaign_name: str, reply_text: str) -> str:
     """Use Claude to draft an email reply."""
     # Finalized system prompt text (keeps placeholders intact). Stored as a
     # raw triple-quoted string to avoid accidental formatting of braces.
@@ -198,11 +197,9 @@ If the reply should NOT receive a response, output only: NO RESPONSE
 10. Read the original outbound email carefully. Do not contradict anything that was said in it.
 """
 
-    # Append the scheduling block and signing/campaign metadata safely
+    # Append signing/campaign metadata and the email thread
     full_prompt = (
         prompt
-        + "\n\nSCHEDULING_BLOCK:\n"
-        + (scheduling_block or "")
         + "\n\nSign off with this name exactly: "
         + sender_name
         + "\nCampaign: "
@@ -545,7 +542,7 @@ def incoming_reply():
     available_slots = fetch_available_slots(cal_info["event_type"])
     scheduling_block = format_slots_for_email(available_slots, cal_info["fallback_url"])
     slack_slots_text = format_slots_for_slack(available_slots, cal_info["fallback_url"])
-    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text, scheduling_block)
+    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text)
     print(f"[draft] Generated {len(draft)} chars for {lead_email} ({len(available_slots)} days of slots fetched)")
 
     # Step 5: Build Slack message with action buttons
