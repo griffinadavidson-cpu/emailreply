@@ -29,7 +29,7 @@ CALENDLY_O2E_EVENT_TYPE = os.getenv(
 CALENDLY_STATE17_EVENT_TYPE = os.getenv("CALENDLY_STATE17_EVENT_TYPE", "")
 # Fallback booking page URLs (used when API fails or event type not configured)
 CALENDLY_O2E_URL = os.getenv("CALENDLY_O2E_URL", "https://calendly.com/gdavidson-options2exit/introcall")
-CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/PLACEHOLDER-state17/meeting")
+CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/team-state17/30min")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
