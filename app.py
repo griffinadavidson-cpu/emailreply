@@ -481,8 +481,15 @@ def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
                          body: str, thread_html: str = "",
                          wrote_line: str = "") -> dict:
     """Send a reply via Instantly with proper HTML threading."""
-    html_body = body.replace("\n", "<br>")
+    # Convert markdown autolinks <https://...> into real anchor tags
+    # so they don't get stripped as unknown HTML tags.
+    body = re.sub(
+        r'<(https?://[^>\s]+)>',
+        r'<a href="\1">\1</a>',
+        body,
+    )
 
+    html_body = body.replace("\n", "<br>")
     full_html = f"<div>{html_body}</div>"
     if thread_html:
         if wrote_line:
